@@ -214,12 +214,6 @@ Important errors:
 
 While the crate is `0.x`, minor versions may include API changes. Pin exact versions for production deployments.
 
-## Upstream attribution
-
-This crate started as a vendored Rust implementation from `corespeed-io/wechatbot`, then was refactored into an explicit-state WeChat iLink protocol client.
-
-See [`UPSTREAM.md`](UPSTREAM.md) for attribution.
-
 ## License
 
 MIT

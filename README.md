@@ -213,12 +213,6 @@ bot.send_media_with_context(
 
 在 `0.x` 阶段，minor 版本可能包含 API 变化。生产部署建议锁定精确版本。
 
-## 上游来源
-
-本 crate 最初来自 `corespeed-io/wechatbot` 的 vendored Rust 实现，之后重构为显式状态的 WeChat iLink 协议客户端。
-
-上游来源见 [`UPSTREAM.md`](UPSTREAM.md)。
-
 ## 许可证
 
 MIT
