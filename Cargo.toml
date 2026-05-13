@@ -1,0 +1,34 @@
+[package]
+name = "wechat-ilink"
+version = "0.3.2"
+edition = "2021"
+description = "Unofficial WeChat iLink protocol client for Rust with explicit context and cursor APIs"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/tuchg/wechat-ilink"
+documentation = "https://docs.rs/wechat-ilink"
+keywords = ["wechat", "ilink", "protocol", "async", "bot"]
+categories = ["api-bindings", "asynchronous"]
+
+[dependencies]
+aes = "0.8"
+base64 = "0.22"
+hex = "0.4"
+md-5 = "0.10"
+rand = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_repr = "0.1"
+tokio = { version = "1", default-features = false, features = ["fs", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+tracing = "0.1"
+urlencoding = "2"
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+
+[[example]]
+name = "external_store_keepalive"
+path = "examples/external_store_keepalive.rs"
