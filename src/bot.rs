@@ -964,24 +964,25 @@ fn chunk_text(text: &str, limit: usize) -> Vec<String> {
             chunks.push(remaining.to_string());
             break;
         }
-        let window = &remaining[..limit];
+        let window_end = char_boundary_at_or_before(remaining, limit);
+        let window = &remaining[..window_end];
         let cut = window
             .rfind("\n\n")
-            .filter(|&i| i > limit * 3 / 10)
+            .filter(|&i| i > window_end * 3 / 10)
             .map(|i| i + 2)
             .or_else(|| {
                 window
                     .rfind('\n')
-                    .filter(|&i| i > limit * 3 / 10)
+                    .filter(|&i| i > window_end * 3 / 10)
                     .map(|i| i + 1)
             })
             .or_else(|| {
                 window
                     .rfind(' ')
-                    .filter(|&i| i > limit * 3 / 10)
+                    .filter(|&i| i > window_end * 3 / 10)
                     .map(|i| i + 1)
             })
-            .unwrap_or(limit);
+            .unwrap_or(window_end);
         chunks.push(remaining[..cut].to_string());
         remaining = &remaining[cut..];
     }
@@ -990,6 +991,14 @@ fn chunk_text(text: &str, limit: usize) -> Vec<String> {
     } else {
         chunks
     }
+}
+
+fn char_boundary_at_or_before(text: &str, limit: usize) -> usize {
+    let mut end = limit.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 fn context_account_key(creds: &Credentials) -> &str {
@@ -1041,6 +1050,18 @@ mod tests {
         let text = "abcdef";
         let chunks = chunk_text(text, 6);
         assert_eq!(chunks, vec!["abcdef"]);
+    }
+
+    #[test]
+    fn chunk_text_does_not_split_utf8_char_boundary() {
+        let mut text = "a".repeat(3999);
+        text.push('启');
+        text.push_str("tail");
+
+        let chunks = chunk_text(&text, 4000);
+
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 4000));
     }
 
     #[test]
