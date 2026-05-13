@@ -17,7 +17,7 @@ Unofficial WeChat iLink protocol client for Rust with explicit context and curso
 
 ```toml
 [dependencies]
-wechat-ilink = "0.3"
+wechat-ilink = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
