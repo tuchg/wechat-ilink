@@ -83,6 +83,8 @@ async fn my_load_cursor() -> Option<String> { None }
 
 See [`examples/external_store_keepalive.rs`](examples/external_store_keepalive.rs) for a complete external store and keep-alive reminder example.
 
+See [`examples/multi_account_context_store.rs`](examples/multi_account_context_store.rs) for multiple login accounts with separate credentials, cursors, and context stores.
+
 ## What this crate does
 
 `wechat-ilink` is a low-level async protocol client. It handles:
@@ -166,9 +168,10 @@ For one update batch, the SDK emits `ContextObserved` / `Message` before `Cursor
 
 ## External context store and keep-alive reminder example
 
-The full example is intentionally outside the README:
+Full examples are intentionally outside the README:
 
-[`examples/external_store_keepalive.rs`](examples/external_store_keepalive.rs)
+- [`examples/external_store_keepalive.rs`](examples/external_store_keepalive.rs): external storage plus a 4-hour keep-alive reminder.
+- [`examples/multi_account_context_store.rs`](examples/multi_account_context_store.rs): multiple login accounts, each with separate credentials, cursors, and context stores.
 
 It shows how to:
 

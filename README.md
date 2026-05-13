@@ -82,6 +82,8 @@ async fn my_load_cursor() -> Option<String> { None }
 
 完整的外部存储与保活提醒示例见 [`examples/external_store_keepalive.rs`](examples/external_store_keepalive.rs)。
 
+多登录账号示例见 [`examples/multi_account_context_store.rs`](examples/multi_account_context_store.rs)。
+
 ## 这个 crate 做什么
 
 `wechat-ilink` 是底层异步协议客户端，负责：
@@ -165,9 +167,10 @@ bot.send_media_with_context(
 
 ## 外部存储 context 与保活提醒示例
 
-完整示例不放在 README 里，见：
+完整示例不放在 README 里：
 
-[`examples/external_store_keepalive.rs`](examples/external_store_keepalive.rs)
+- [`examples/external_store_keepalive.rs`](examples/external_store_keepalive.rs)：外部存储 + 每 4 小时保活提醒。
+- [`examples/multi_account_context_store.rs`](examples/multi_account_context_store.rs)：多个登录账号，每个账号独立 credentials/cursor/context store。
 
 这个示例演示：
 

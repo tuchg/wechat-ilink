@@ -32,3 +32,7 @@ tokio = { version = "1", default-features = false, features = ["fs", "macros", "
 [[example]]
 name = "external_store_keepalive"
 path = "examples/external_store_keepalive.rs"
+
+[[example]]
+name = "multi_account_context_store"
+path = "examples/multi_account_context_store.rs"
