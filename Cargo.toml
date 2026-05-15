@@ -2,7 +2,7 @@
 name = "wechat-ilink"
 version = "0.2.0"
 edition = "2021"
-description = "Unofficial WeChat iLink protocol client for Rust with explicit context and cursor APIs"
+description = "Stateless Rust async client for the WeChat iLink long-polling protocol. QR login, event-driven messaging, typed ret=-2 rate-limit with backoff, and context-TTL expiry reminders. All state lives in your app."
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/tuchg/wechat-ilink"

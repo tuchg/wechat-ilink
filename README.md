@@ -1,6 +1,6 @@
 # wechat-ilink
 
-非官方 WeChat iLink Rust 协议客户端，使用显式 context 和 cursor API。
+非官方 WeChat iLink 协议客户端：长轮询 · QR 登录 · 类型化速率限制（ret=-2）与自动退避 · context TTL 过期提醒 · 显式 context 发送文本/媒体/typing · CDN 上传/下载。全无状态 —— 所有 credentials / context / cursor 由应用管理。
 
 English: [README.en.md](README.en.md)
 

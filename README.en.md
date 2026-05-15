@@ -1,6 +1,6 @@
 # wechat-ilink
 
-Unofficial WeChat iLink protocol client for Rust with explicit context and cursor APIs.
+Async WeChat iLink protocol client for Rust. Builder-based, event-driven, and fully stateless — your app owns credentials, context tokens, and cursors. Handles long-polling, QR login, typed rate limiting with automatic backoff, and context-expiry interaction events.
 
 中文：[README.md](README.md)
 
