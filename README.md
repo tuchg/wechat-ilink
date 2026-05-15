@@ -1,6 +1,6 @@
 # wechat-ilink
 
-非官方 WeChat iLink 协议客户端：长轮询 · QR 登录 · 类型化速率限制（ret=-2）与自动退避 · context TTL 过期提醒 · 显式 context 发送文本/媒体/typing · CDN 上传/下载。全无状态 —— 所有 credentials / context / cursor 由应用管理。
+非官方 WeChat iLink 协议客户端：QR 登录 · 事件驱动轮询 · 自动从入站消息观测并刷新 context · 类型化速率限制（ret=-2）与自动退避 · context TTL 过期交互事件 · 显式 context 发送文本/媒体/typing · CDN 上传/下载。全无状态 —— 所有 credentials / context / cursor 由应用管理。
 
 English: [README.en.md](README.en.md)
 
@@ -17,7 +17,7 @@ English: [README.en.md](README.en.md)
 
 ```toml
 [dependencies]
-wechat-ilink = "0.1"
+wechat-ilink = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

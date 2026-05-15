@@ -1,13 +1,13 @@
 [package]
 name = "wechat-ilink"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
-description = "Stateless Rust async client for the WeChat iLink long-polling protocol. QR login, event-driven messaging, typed ret=-2 rate-limit with backoff, and context-TTL expiry reminders. All state lives in your app."
+description = "Stateless async WeChat iLink client for Rust: QR login, event-driven polling, automatic context refresh from incoming messages, and typed ret=-2 rate-limit backoff."
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/tuchg/wechat-ilink"
 documentation = "https://docs.rs/wechat-ilink"
-keywords = ["wechat", "ilink", "rate-limiting", "long-polling", "qr-login"]
+keywords = ["wechat", "ilink", "async", "context-refresh", "rate-limiting"]
 categories = ["api-bindings", "asynchronous"]
 
 [dependencies]

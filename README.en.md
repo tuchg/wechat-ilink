@@ -1,6 +1,6 @@
 # wechat-ilink
 
-Async WeChat iLink protocol client for Rust. Builder-based, event-driven, and fully stateless — your app owns credentials, context tokens, and cursors. Handles long-polling, QR login, typed rate limiting with automatic backoff, and context-expiry interaction events.
+Async WeChat iLink protocol client for Rust. Builder-based, event-driven, and fully stateless — your app owns credentials, context tokens, and cursors. Handles QR login, event-driven polling, automatic context refresh from incoming messages, typed rate limiting with automatic backoff, and context-expiry interaction events.
 
 中文：[README.md](README.md)
 
@@ -17,7 +17,7 @@ Async WeChat iLink protocol client for Rust. Builder-based, event-driven, and fu
 
 ```toml
 [dependencies]
-wechat-ilink = "0.1"
+wechat-ilink = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
