@@ -17,7 +17,7 @@ Stream-first async WeChat iLink protocol client for Rust. Builder-based, event-d
 
 ```toml
 [dependencies]
-wechat-ilink = "0.3"
+wechat-ilink = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -59,7 +59,7 @@ async fn main() -> wechat_ilink::Result<()> {
     if let Some(credentials) = my_load_credentials().await {
         client.set_credentials(credentials).await;
     } else {
-        let mut login = client.login_qr_stream();
+        let mut login = client.login_qr();
         while let Some(event) = login.next().await {
             match event? {
                 LoginQrEvent::QrCode { content } => eprintln!("scan QR: {content}"),
@@ -77,7 +77,7 @@ async fn main() -> wechat_ilink::Result<()> {
     }
 
     let cursor = my_load_cursor().await;
-    let mut events = client.stream_from_cursor(cursor);
+    let mut events = client.events_from_cursor(cursor);
     while let Some(event) = events.next().await {
         match event? {
             WechatEvent::ContextObserved(context) => {
@@ -86,7 +86,7 @@ async fn main() -> wechat_ilink::Result<()> {
                 let _ = context;
             }
             WechatEvent::CursorAdvanced { account_key, cursor } => {
-                // Persist cursor and pass it to stream_from_cursor on next startup.
+                // Persist cursor and pass it to events_from_cursor on next startup.
                 let _ = (account_key, cursor);
             }
             WechatEvent::Message(message) => {
@@ -187,7 +187,7 @@ bot.send_media_with_context(
 
 ## Events
 
-`stream_from_cursor` is the recommended integration point:
+`events_from_cursor` is the recommended integration point:
 
 - `ContextObserved(WechatContext)`: a new context token was observed from an incoming message.
 - `Message(IncomingMessage)`: parsed incoming message.

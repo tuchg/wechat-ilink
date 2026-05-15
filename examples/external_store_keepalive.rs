@@ -180,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let cursor = store.cursor(&account_key).await;
-    let mut events = Arc::clone(&client).stream_from_cursor(cursor);
+    let mut events = Arc::clone(&client).events_from_cursor(cursor);
     while let Some(event) = events.next().await {
         match event? {
             WechatEvent::ContextObserved(context) => {
@@ -217,7 +217,7 @@ async fn login_and_save(
     client: &WechatIlinkClient,
     store: &Store,
 ) -> wechat_ilink::Result<Credentials> {
-    let mut login = client.login_qr_stream();
+    let mut login = client.login_qr();
     while let Some(event) = login.next().await {
         match event? {
             LoginQrEvent::QrCode { content } => eprintln!("scan QR: {content}"),

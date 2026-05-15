@@ -17,7 +17,7 @@ English: [README.en.md](README.en.md)
 
 ```toml
 [dependencies]
-wechat-ilink = "0.3"
+wechat-ilink = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -58,7 +58,7 @@ async fn main() -> wechat_ilink::Result<()> {
     if let Some(credentials) = my_load_credentials().await {
         client.set_credentials(credentials).await;
     } else {
-        let mut login = client.login_qr_stream();
+        let mut login = client.login_qr();
         while let Some(event) = login.next().await {
             match event? {
                 LoginQrEvent::QrCode { content } => eprintln!("scan QR: {content}"),
@@ -76,7 +76,7 @@ async fn main() -> wechat_ilink::Result<()> {
     }
 
     let cursor = my_load_cursor().await;
-    let mut events = client.stream_from_cursor(cursor);
+    let mut events = client.events_from_cursor(cursor);
     while let Some(event) = events.next().await {
         match event? {
             WechatEvent::ContextObserved(context) => {
@@ -84,7 +84,7 @@ async fn main() -> wechat_ilink::Result<()> {
                 let _ = context;
             }
             WechatEvent::CursorAdvanced { account_key, cursor } => {
-                // 保存 cursor，下次启动传给 stream_from_cursor。
+                // 保存 cursor，下次启动传给 events_from_cursor。
                 let _ = (account_key, cursor);
             }
             WechatEvent::Message(message) => {
@@ -186,7 +186,7 @@ bot.send_media_with_context(
 
 ## 事件
 
-推荐通过 `stream_from_cursor` 集成：
+推荐通过 `events_from_cursor` 集成：
 
 - `ContextObserved(WechatContext)`：从入站消息观察到新的 context token。
 - `Message(IncomingMessage)`：解析后的入站消息。

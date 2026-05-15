@@ -1,6 +1,6 @@
 [package]
 name = "wechat-ilink"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Stream-first stateless async WeChat iLink client for Rust: QR login, event-driven polling, automatic context refresh, and typed ret=-2 rate-limit backoff."
 license = "MIT"

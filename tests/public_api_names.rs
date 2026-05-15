@@ -11,8 +11,8 @@ async fn renamed_public_api_is_available_from_wechat_ilink_crate() {
             .markdown_filter(true)
             .build(),
     );
-    let _events = client.clone().stream_from_cursor(None);
-    let _login = client.login_qr_stream();
+    let _events = client.clone().events_from_cursor(None);
+    let _login = client.login_qr();
     let _: Option<WechatEvent> = None;
     let _: Option<LoginQrEvent> = None;
 

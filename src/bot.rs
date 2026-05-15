@@ -403,7 +403,7 @@ impl WechatIlinkClient {
     /// Applications display [`LoginQrEvent::QrCode`], optionally answer
     /// [`LoginQrEvent::NeedVerifyCode`], and persist credentials from
     /// [`LoginQrEvent::Confirmed`].
-    pub fn login_qr_stream(&self) -> LoginQrStream<'_> {
+    pub fn login_qr(&self) -> LoginQrStream<'_> {
         LoginQrStream::new(async_stream::stream! {
             let base_url = self.base_url.read().await.clone();
             let mut qr_refresh_count = 0u32;
@@ -551,13 +551,8 @@ impl WechatIlinkClient {
         })
     }
 
-    /// Subscribe to events emitted by polling and outbound-send bookkeeping.
-    pub fn event_stream(&self) -> WechatEventStream<'static> {
-        event_stream_from_receiver(self.event_tx.subscribe())
-    }
-
     /// Start polling from an externally persisted cursor and stream resulting events.
-    pub fn stream_from_cursor(
+    pub fn events_from_cursor(
         self: Arc<Self>,
         cursor: Option<String>,
     ) -> WechatEventStream<'static> {
@@ -1249,6 +1244,7 @@ impl WechatIlinkClient {
     }
 }
 
+#[cfg(test)]
 fn event_stream_from_receiver(
     mut rx: broadcast::Receiver<WechatEvent>,
 ) -> WechatEventStream<'static> {
@@ -1617,9 +1613,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_from_cursor_reports_missing_auth_without_storing_cursor() {
+    async fn events_from_cursor_reports_missing_auth_without_storing_cursor() {
         let client = Arc::new(WechatIlinkClient::new());
-        let mut events = client.stream_from_cursor(Some("external-cursor".to_string()));
+        let mut events = client.events_from_cursor(Some("external-cursor".to_string()));
 
         let err = events
             .next()
@@ -1672,7 +1668,7 @@ mod tests {
             .rate_limit_interaction_window(Duration::from_secs(300))
             .build();
         client.set_credentials(test_credentials()).await;
-        let mut events = client.event_stream();
+        let mut events = event_stream_from_receiver(client.event_tx.subscribe());
 
         client.record_successful_message_send().await;
         client.record_successful_message_send().await;
@@ -1703,7 +1699,7 @@ mod tests {
             .context_ttl(Duration::from_millis(5))
             .context_expiry_remind_before(Duration::from_millis(5))
             .build();
-        let mut events = client.event_stream();
+        let mut events = event_stream_from_receiver(client.event_tx.subscribe());
 
         let context = WechatContext {
             account_key: "account-1".to_string(),
@@ -1776,7 +1772,7 @@ mod tests {
     #[tokio::test]
     async fn event_stream_accepts_context_observed_and_cursor_events() {
         let client = WechatIlinkClient::new();
-        let mut events = client.event_stream();
+        let mut events = event_stream_from_receiver(client.event_tx.subscribe());
 
         client.emit_event(WechatEvent::ContextObserved(WechatContext {
             account_key: "account-1".to_string(),

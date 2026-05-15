@@ -13,7 +13,7 @@
 //! async fn main() -> wechat_ilink::Result<()> {
 //!     let client = Arc::new(WechatIlinkClient::builder().build());
 //!
-//!     let mut login = client.login_qr_stream();
+//!     let mut login = client.login_qr();
 //!     while let Some(event) = login.next().await {
 //!         match event? {
 //!             LoginQrEvent::QrCode { content } => eprintln!("scan QR: {content}"),
@@ -31,7 +31,7 @@
 //!
 //!     drop(login);
 //!
-//!     let mut events = client.stream_from_cursor(None);
+//!     let mut events = client.events_from_cursor(None);
 //!     while let Some(event) = events.next().await {
 //!         println!("{:?}", event?);
 //!     }
