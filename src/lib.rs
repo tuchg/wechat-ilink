@@ -31,8 +31,8 @@ pub mod protocol;
 pub mod types;
 
 pub use bot::{
-    EventHandler, MessageHandler, SendContent, SendReceipt, WechatEvent, WechatIlinkClient,
-    WechatIlinkClientBuilder,
+    EventHandler, MessageHandler, SendContent, SendReceipt, UserInteractionReason, WechatEvent,
+    WechatIlinkClient, WechatIlinkClientBuilder, WechatRateLimitOptions,
 };
 pub use cdn::CdnClient;
 pub use crypto::{

@@ -19,6 +19,9 @@ pub const CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 pub const CHANNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_BOT_AGENT: &str = "OpenClaw";
 pub const DEFAULT_ILINK_APP_ID: &str = "bot";
+pub const DEFAULT_RATE_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(90);
+
+const RATE_LIMIT_ERRCODE: i32 = -2;
 
 /// Common request metadata attached to every CGI request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,11 +222,7 @@ impl ILinkClient {
             let msg = result
                 .errmsg
                 .unwrap_or_else(|| format!("ret={}", result.ret));
-            return Err(WechatIlinkError::Api {
-                message: msg,
-                http_status: 200,
-                errcode: code,
-            });
+            return Err(api_error(msg, 200, code));
         }
         Ok(result)
     }
@@ -347,15 +346,12 @@ impl ILinkClient {
         let value: Value = serde_json::from_str(&text).unwrap_or(json!({}));
 
         if status >= 400 {
-            return Err(WechatIlinkError::Api {
-                message: value["errmsg"]
-                    .as_str()
-                    .or_else(|| value["message"].as_str())
-                    .unwrap_or(&text)
-                    .to_string(),
-                http_status: status,
-                errcode: value["errcode"].as_i64().unwrap_or(0) as i32,
-            });
+            let code = value["errcode"].as_i64().unwrap_or(0) as i32;
+            return Err(api_error(
+                api_error_message(&value, &text, code),
+                status,
+                code,
+            ));
         }
 
         let api_error_code = value["errcode"]
@@ -363,19 +359,47 @@ impl ILinkClient {
             .filter(|code| *code != 0)
             .or_else(|| value["ret"].as_i64().filter(|code| *code != 0));
         if let Some(code) = api_error_code {
-            return Err(WechatIlinkError::Api {
-                message: value["errmsg"]
-                    .as_str()
-                    .or_else(|| value["message"].as_str())
-                    .unwrap_or(&text)
-                    .to_string(),
-                http_status: status,
-                errcode: code as i32,
-            });
+            let code = code as i32;
+            return Err(api_error(
+                api_error_message(&value, &text, code),
+                status,
+                code,
+            ));
         }
 
         Ok(value)
     }
+}
+
+fn api_error(message: String, http_status: u16, errcode: i32) -> WechatIlinkError {
+    if errcode == RATE_LIMIT_ERRCODE {
+        WechatIlinkError::RateLimited {
+            retry_after: DEFAULT_RATE_LIMIT_RETRY_AFTER,
+            message,
+            http_status,
+            errcode,
+        }
+    } else {
+        WechatIlinkError::Api {
+            message,
+            http_status,
+            errcode,
+        }
+    }
+}
+
+fn api_error_message(value: &Value, raw_body: &str, code: i32) -> String {
+    value["errmsg"]
+        .as_str()
+        .or_else(|| value["message"].as_str())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            if code != 0 || raw_body.trim().is_empty() || raw_body.trim() == "{}" {
+                format!("ret={code}")
+            } else {
+                raw_body.to_string()
+            }
+        })
 }
 
 fn log_raw_getupdates_response(resp: &Value) {
@@ -842,6 +866,33 @@ mod tests {
                 assert_eq!(errcode, 40003);
             }
             other => panic!("expected API error, got {other:?}"),
+        }
+        server.join().expect("response server should exit");
+    }
+
+    #[tokio::test]
+    async fn send_message_maps_ret_minus_two_to_rate_limited() {
+        let (base_url, server) = json_response_server(r#"{"ret":-2}"#);
+        let client = ILinkClient::new();
+
+        let err = client
+            .send_message(&base_url, "token", &json!({"text": "hello"}))
+            .await
+            .expect_err("ret=-2 must be treated as rate limiting");
+
+        match err {
+            WechatIlinkError::RateLimited {
+                retry_after,
+                message,
+                http_status,
+                errcode,
+            } => {
+                assert_eq!(retry_after, Duration::from_secs(90));
+                assert_eq!(message, "ret=-2");
+                assert_eq!(http_status, 200);
+                assert_eq!(errcode, -2);
+            }
+            other => panic!("expected rate limit error, got {other:?}"),
         }
         server.join().expect("response server should exit");
     }

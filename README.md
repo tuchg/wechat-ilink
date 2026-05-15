@@ -41,6 +41,13 @@ async fn main() -> wechat_ilink::Result<()> {
         .ilink_app_id("bot")
         // 默认启用。关闭后，发送文本不会做 WeChat Markdown 兼容过滤。
         .markdown_filter(true)
+        // ret=-2 默认等待 90s，最多重试 5 次；接近 5 分钟 6 条时发事件。
+        .rate_limit_retry_after(std::time::Duration::from_secs(90))
+        .rate_limit_max_retries(5)
+        .rate_limit_interaction_threshold(6)
+        // context 默认 24h TTL，到期前 30 分钟发 UserInteractionRequested 事件。
+        .context_ttl(std::time::Duration::from_secs(24 * 60 * 60))
+        .context_expiry_remind_before(std::time::Duration::from_secs(30 * 60))
         .on_qr_url(|url| eprintln!("scan QR: {url}"))
         .build();
 
@@ -67,6 +74,10 @@ async fn main() -> wechat_ilink::Result<()> {
             }
             WechatEvent::AuthSessionExpired { account_key } => {
                 eprintln!("auth expired: {account_key}");
+            }
+            WechatEvent::UserInteractionRequested { account_key, user_id, reason } => {
+                // SDK 只通知；应用决定是否提醒用户在微信里发一条消息来刷新窗口。
+                eprintln!("user interaction suggested: {account_key} {user_id:?} {reason:?}");
             }
         }))
         .await;
@@ -115,6 +126,7 @@ WechatEvent::ContextObserved(WechatContext)
 
 - 每个用户/账号的 `WechatContext`，用于之后主动发送；
 - `WechatEvent::CursorAdvanced` 中的 cursor，用于重启后继续轮询；
+- `WechatEvent::UserInteractionRequested` 用于通知应用“需要用户在微信里发条消息”：包括 context 接近过期、每账号 5 分钟内主动发送达到 6 条；用户在微信端发来消息会重置这些窗口；
 - 自己的提醒记录，例如每几个小时提醒用户发测试消息刷新 context。
 
 ## 发送消息
@@ -162,8 +174,9 @@ bot.send_media_with_context(
 - `Message(IncomingMessage)`：解析后的入站消息。
 - `CursorAdvanced { account_key, cursor }`：轮询 cursor 前进，调用方应保存。
 - `AuthSessionExpired { account_key }`：登录态过期，需要重新登录。
+- `UserInteractionRequested { account_key, user_id, reason }`：SDK 建议应用请求用户在微信里发条消息。`reason` 可能是 context 接近过期，或该账号主动发送在窗口内达到阈值（默认 5 分钟内 6 条）。SDK 只通知，调用方决定是否提示用户、发什么、走哪个通道。
 
-同一个 update batch 中，SDK 会先发 `ContextObserved` / `Message`，再发 `CursorAdvanced`。因此调用方可以先保存消息派生状态，再保存 cursor。
+同一个 update batch 中，SDK 会先发 `ContextObserved` / `Message`，再发 `CursorAdvanced`。因此调用方可以先保存消息派生状态，再保存 cursor。用户在微信终端发来消息时，SDK 会重置该账号的主动发送计数和 rate-limit 退避。
 
 ## 外部存储 context 与保活提醒示例
 
@@ -177,7 +190,7 @@ bot.send_media_with_context(
 1. 在 SDK 外部用 JSON 文件保存 `WechatContext`；
 2. 在 SDK 外部保存 polling cursor；
 3. 每 4 小时主动提醒用户回复“测试”；
-4. 用户回复后通过 `ContextObserved` 刷新 context token。
+4. 用户回复后通过 `ContextObserved` 刷新 context token，并重置 SDK 的主动发送窗口。
 
 生产环境建议把示例里的 JSON 文件替换成 SQLite、Postgres、Redis 或你自己的存储。
 
@@ -191,7 +204,8 @@ bot.send_media_with_context(
 - `context_token` 持久化；
 - cursor 持久化；
 - 保活提醒策略；
-- 重试/抑制策略；
+- 大量业务消息的持久队列或合并策略；
+- 应用层重试/抑制策略；
 - bot 工作流或会话编排。
 
 这些属于应用层。

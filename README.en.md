@@ -41,6 +41,13 @@ async fn main() -> wechat_ilink::Result<()> {
         .ilink_app_id("bot")
         // Enabled by default. Disable to send text without WeChat Markdown filtering.
         .markdown_filter(true)
+        // ret=-2 defaults to 90s wait and 5 retries; event fires near 6 sends / 5 minutes.
+        .rate_limit_retry_after(std::time::Duration::from_secs(90))
+        .rate_limit_max_retries(5)
+        .rate_limit_interaction_threshold(6)
+        // Context defaults to 24h TTL; event fires 30 minutes before expiry.
+        .context_ttl(std::time::Duration::from_secs(24 * 60 * 60))
+        .context_expiry_remind_before(std::time::Duration::from_secs(30 * 60))
         .on_qr_url(|url| eprintln!("scan QR: {url}"))
         .build();
 
@@ -68,6 +75,10 @@ async fn main() -> wechat_ilink::Result<()> {
             }
             WechatEvent::AuthSessionExpired { account_key } => {
                 eprintln!("auth expired: {account_key}");
+            }
+            WechatEvent::UserInteractionRequested { account_key, user_id, reason } => {
+                // SDK only notifies; the app decides whether to ask the user to reply in WeChat.
+                eprintln!("user interaction suggested: {account_key} {user_id:?} {reason:?}");
             }
         }))
         .await;
@@ -163,8 +174,9 @@ bot.send_media_with_context(
 - `Message(IncomingMessage)`: parsed incoming message.
 - `CursorAdvanced { account_key, cursor }`: polling cursor advanced; persist it.
 - `AuthSessionExpired { account_key }`: auth expired; re-login is required.
+- `UserInteractionRequested { account_key, user_id, reason }`: the SDK suggests asking the user to send a WeChat message. `reason` may be context expiry or proactive sends reaching the configured account threshold (default: 6 messages in 5 minutes). The SDK only notifies; callers decide whether and what to send, and via which channel.
 
-For one update batch, the SDK emits `ContextObserved` / `Message` before `CursorAdvanced`, so callers can persist message-derived state before saving the cursor.
+For one update batch, the SDK emits `ContextObserved` / `Message` before `CursorAdvanced`, so callers can persist message-derived state before saving the cursor. When the user sends a WeChat message, the SDK resets that account's proactive-send counter and rate-limit backoff.
 
 ## External context store and keep-alive reminder example
 
@@ -178,7 +190,7 @@ It shows how to:
 1. store `WechatContext` outside the SDK in a JSON file;
 2. store the polling cursor outside the SDK;
 3. send a proactive reminder every 4 hours asking users to reply with “测试”;
-4. refresh the context token from `ContextObserved` when the user replies.
+4. refresh the context token from `ContextObserved` when the user replies, which also resets the SDK proactive-send window.
 
 In production, replace the JSON file with SQLite, Postgres, Redis, or your own store.
 
@@ -192,7 +204,8 @@ In production, replace the JSON file with SQLite, Postgres, Redis, or your own s
 - `context_token` persistence;
 - cursor persistence;
 - keep-alive reminder policy;
-- retry/suppression policy;
+- durable queues or message coalescing for large application backlogs;
+- application-level retry/suppression policy;
 - bot workflow or conversation orchestration.
 
 Those belong in your application.

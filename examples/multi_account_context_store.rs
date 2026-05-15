@@ -178,6 +178,15 @@ async fn run_account(
                             "[{account_name}] auth expired for {account_key}; re-login required"
                         );
                     }
+                    WechatEvent::UserInteractionRequested {
+                        account_key,
+                        user_id,
+                        reason,
+                    } => {
+                        eprintln!(
+                            "[{account_name}] user interaction suggested for {account_key}, user {user_id:?}: {reason:?}"
+                        );
+                    }
                 }
             });
         }))

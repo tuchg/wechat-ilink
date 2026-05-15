@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// Errors that can occur in the SDK.
@@ -5,6 +7,14 @@ use thiserror::Error;
 pub enum WechatIlinkError {
     #[error("API error: {message} (http={http_status}, errcode={errcode})")]
     Api {
+        message: String,
+        http_status: u16,
+        errcode: i32,
+    },
+
+    #[error("Rate limited: {message} (http={http_status}, errcode={errcode}, retry_after={}s)", retry_after.as_secs())]
+    RateLimited {
+        retry_after: Duration,
         message: String,
         http_status: u16,
         errcode: i32,
@@ -36,6 +46,19 @@ impl WechatIlinkError {
     /// Returns true if this is a session-expired error (errcode -14).
     pub fn is_session_expired(&self) -> bool {
         matches!(self, WechatIlinkError::Api { errcode: -14, .. })
+    }
+
+    /// Returns true if this is a bot-wide iLink rate limit response (ret/errcode -2).
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, WechatIlinkError::RateLimited { .. })
+    }
+
+    /// Returns the suggested delay before retrying a rate-limited request.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            WechatIlinkError::RateLimited { retry_after, .. } => Some(*retry_after),
+            _ => None,
+        }
     }
 }
 

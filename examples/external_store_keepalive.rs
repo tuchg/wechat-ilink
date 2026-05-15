@@ -176,6 +176,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     WechatEvent::Message(message) => {
                         println!("{}: {}", message.user_id, message.text);
                     }
+                    WechatEvent::UserInteractionRequested {
+                        account_key,
+                        user_id,
+                        reason,
+                    } => {
+                        eprintln!(
+                            "WeChat user interaction suggested for account {account_key}, user {user_id:?}: {reason:?}"
+                        );
+                    }
                 }
             });
         }))

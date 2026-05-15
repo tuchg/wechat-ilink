@@ -1,9 +1,11 @@
 //! Main WechatIlinkClient.
 
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -34,6 +36,15 @@ pub enum WechatEvent {
     CursorAdvanced { account_key: String, cursor: String },
     /// The current auth session has expired and re-login is required.
     AuthSessionExpired { account_key: String },
+    /// The SDK observed that user interaction would refresh WeChat state.
+    ///
+    /// The SDK does not send a reminder. Applications decide whether to notify
+    /// users and what wording/channel to use.
+    UserInteractionRequested {
+        account_key: String,
+        user_id: Option<String>,
+        reason: UserInteractionReason,
+    },
 }
 
 /// Message ids produced by a send operation.
@@ -68,6 +79,66 @@ impl SendReceipt {
     }
 }
 
+/// Why the SDK suggests asking a WeChat user to interact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserInteractionReason {
+    /// A stored context is nearing expiry.
+    ContextExpiring {
+        observed_at: SystemTime,
+        expires_at: SystemTime,
+        remind_before: Duration,
+    },
+    /// Proactive outbound sends are close to the bot-wide iLink rate limit.
+    OutboundRateLimitApproaching {
+        sent_count: usize,
+        window: Duration,
+        threshold: usize,
+    },
+}
+
+/// Rate-limit and context-refresh policy for iLink requests.
+#[derive(Debug, Clone)]
+pub struct WechatRateLimitOptions {
+    /// Delay used before retrying `ret=-2` / `errcode=-2`.
+    pub retry_after: Duration,
+    /// Number of retries after the initial rate-limited attempt.
+    pub retry_attempts: usize,
+    /// Rolling account window used to request proactive user interaction.
+    pub interaction_window: Duration,
+    /// Emit interaction event at this send count.
+    pub interaction_threshold: usize,
+    /// Expected context lifetime after a user WeChat message.
+    pub context_ttl: Duration,
+    /// Emit context-expiring interaction event this long before expiry.
+    pub context_remind_before: Duration,
+}
+
+impl Default for WechatRateLimitOptions {
+    fn default() -> Self {
+        Self {
+            retry_after: protocol::DEFAULT_RATE_LIMIT_RETRY_AFTER,
+            retry_attempts: 5,
+            interaction_window: Duration::from_secs(5 * 60),
+            interaction_threshold: 6,
+            context_ttl: Duration::from_secs(24 * 60 * 60),
+            context_remind_before: Duration::from_secs(30 * 60),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AccountRateLimitState {
+    sent_at: VecDeque<Instant>,
+    next_allowed_at: Option<Instant>,
+}
+
+struct ContextRefreshState {
+    user_id: String,
+    observed_at: SystemTime,
+    expires_at: SystemTime,
+    reminded: bool,
+}
+
 /// Builder for [`WechatIlinkClient`].
 pub struct WechatIlinkClientBuilder {
     base_url: Option<String>,
@@ -75,6 +146,7 @@ pub struct WechatIlinkClientBuilder {
     ilink_app_id: Option<String>,
     route_tag: Option<String>,
     markdown_filter: bool,
+    rate_limit: WechatRateLimitOptions,
     credentials: Option<Credentials>,
     on_qr_url: Option<Box<dyn Fn(&str) + Send + Sync>>,
     on_verify_code: Option<Box<dyn Fn(&str) -> Option<String> + Send + Sync>>,
@@ -89,6 +161,7 @@ impl Default for WechatIlinkClientBuilder {
             ilink_app_id: None,
             route_tag: None,
             markdown_filter: true,
+            rate_limit: WechatRateLimitOptions::default(),
             credentials: None,
             on_qr_url: None,
             on_verify_code: None,
@@ -120,6 +193,54 @@ impl WechatIlinkClientBuilder {
 
     pub fn markdown_filter(mut self, enabled: bool) -> Self {
         self.markdown_filter = enabled;
+        self
+    }
+
+    pub fn rate_limit_options(mut self, options: WechatRateLimitOptions) -> Self {
+        self.rate_limit = options;
+        self
+    }
+
+    pub fn rate_limit_retry_after(mut self, retry_after: Duration) -> Self {
+        self.rate_limit.retry_after = if retry_after.is_zero() {
+            protocol::DEFAULT_RATE_LIMIT_RETRY_AFTER
+        } else {
+            retry_after
+        };
+        self
+    }
+
+    pub fn rate_limit_retry_attempts(mut self, retry_attempts: usize) -> Self {
+        self.rate_limit.retry_attempts = retry_attempts;
+        self
+    }
+
+    pub fn rate_limit_max_retries(mut self, max_retries: usize) -> Self {
+        self.rate_limit.retry_attempts = max_retries;
+        self
+    }
+
+    pub fn context_ttl(mut self, ttl: Duration) -> Self {
+        if !ttl.is_zero() {
+            self.rate_limit.context_ttl = ttl;
+        }
+        self
+    }
+
+    pub fn context_expiry_remind_before(mut self, remind_before: Duration) -> Self {
+        self.rate_limit.context_remind_before = remind_before;
+        self
+    }
+
+    pub fn rate_limit_interaction_window(mut self, window: Duration) -> Self {
+        if !window.is_zero() {
+            self.rate_limit.interaction_window = window;
+        }
+        self
+    }
+
+    pub fn rate_limit_interaction_threshold(mut self, threshold: usize) -> Self {
+        self.rate_limit.interaction_threshold = threshold;
         self
     }
 
@@ -164,9 +285,13 @@ pub struct WechatIlinkClient {
     credentials: RwLock<Option<Credentials>>,
     handlers: Mutex<Vec<MessageHandler>>,
     event_handlers: Mutex<Vec<EventHandler>>,
+    rate_limit_states: Mutex<HashMap<String, AccountRateLimitState>>,
+    context_refresh_states: Mutex<HashMap<(String, String), ContextRefreshState>>,
+    rate_limit_notify: Notify,
     cursor: RwLock<String>,
     base_url: RwLock<String>,
     stopped: RwLock<bool>,
+    rate_limit: WechatRateLimitOptions,
     on_qr_url: Option<Box<dyn Fn(&str) + Send + Sync>>,
     on_verify_code: Option<Box<dyn Fn(&str) -> Option<String> + Send + Sync>>,
     on_error: Option<Box<dyn Fn(&WechatIlinkError) + Send + Sync>>,
@@ -201,9 +326,13 @@ impl WechatIlinkClient {
             credentials: RwLock::new(builder.credentials),
             handlers: Mutex::new(Vec::new()),
             event_handlers: Mutex::new(Vec::new()),
+            rate_limit_states: Mutex::new(HashMap::new()),
+            context_refresh_states: Mutex::new(HashMap::new()),
+            rate_limit_notify: Notify::new(),
             cursor: RwLock::new(String::new()),
             base_url: RwLock::new(base_url),
             stopped: RwLock::new(false),
+            rate_limit: builder.rate_limit,
             on_qr_url: builder.on_qr_url,
             on_verify_code: builder.on_verify_code,
             on_error: builder.on_error,
@@ -420,13 +549,17 @@ impl WechatIlinkClient {
     pub async fn send_typing_with_context(&self, context: &WechatContext) -> Result<()> {
         let (base_url, token) = self.get_auth().await?;
         let config = self
-            .client
-            .get_config(&base_url, &token, &context.user_id, &context.context_token)
+            .retry_rate_limited(|| {
+                self.client
+                    .get_config(&base_url, &token, &context.user_id, &context.context_token)
+            })
             .await?;
         if let Some(ticket) = config.typing_ticket {
-            self.client
-                .send_typing(&base_url, &token, &context.user_id, &ticket, 1)
-                .await?;
+            self.retry_rate_limited(|| {
+                self.client
+                    .send_typing(&base_url, &token, &context.user_id, &ticket, 1)
+            })
+            .await?;
         }
         Ok(())
     }
@@ -576,7 +709,9 @@ impl WechatIlinkClient {
                         if let Some(incoming) =
                             IncomingMessage::from_wire_for_account(wire, &account_key)
                         {
+                            self.reset_account_rate_limit(&account_key).await;
                             if let Some(context) = incoming.context.clone() {
+                                self.observe_context_for_interaction(&context).await;
                                 self.emit_event(WechatEvent::ContextObserved(context)).await;
                             }
                             self.emit_event(WechatEvent::Message(incoming.clone()))
@@ -587,6 +722,7 @@ impl WechatIlinkClient {
                             }
                         }
                     }
+                    self.emit_due_context_interaction_requests().await;
                     if cursor_changed {
                         self.emit_event(WechatEvent::CursorAdvanced {
                             account_key: account_key.clone(),
@@ -611,6 +747,12 @@ impl WechatIlinkClient {
                     }
                     continue;
                 }
+                Err(e) if e.is_rate_limited() => {
+                    self.report_error(&e);
+                    sleep(self.rate_limit.retry_after).await;
+                    retry_delay = Duration::from_secs(1);
+                    continue;
+                }
                 Err(e) => {
                     self.report_error(&e);
                     sleep(retry_delay).await;
@@ -632,6 +774,179 @@ impl WechatIlinkClient {
             }
         }
         Ok(())
+    }
+
+    async fn retry_rate_limited<F, Fut, T>(&self, mut operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let account_key = self.account_key().await;
+        if let Some(wait) = self.active_rate_limit_backoff(&account_key).await {
+            return Err(rate_limited_error(wait));
+        }
+
+        let mut retries = 0usize;
+        loop {
+            match operation().await {
+                Ok(value) => return Ok(value),
+                Err(err) if err.is_rate_limited() => {
+                    let err = with_rate_limit_retry_after(err, self.rate_limit.retry_after);
+                    self.defer_account_rate_limit(&account_key, self.rate_limit.retry_after)
+                        .await;
+                    if retries >= self.rate_limit.retry_attempts {
+                        return Err(err);
+                    }
+                    retries += 1;
+                    self.wait_for_rate_limit_reset_or_timeout(
+                        &account_key,
+                        self.rate_limit.retry_after,
+                    )
+                    .await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    async fn active_rate_limit_backoff(&self, account_key: &str) -> Option<Duration> {
+        if account_key.is_empty() {
+            return None;
+        }
+        let mut states = self.rate_limit_states.lock().await;
+        let state = states.entry(account_key.to_string()).or_default();
+        match state.next_allowed_at {
+            Some(next_allowed_at) => match next_allowed_at.checked_duration_since(Instant::now()) {
+                Some(wait) if !wait.is_zero() => Some(wait),
+                _ => {
+                    state.next_allowed_at = None;
+                    None
+                }
+            },
+            None => None,
+        }
+    }
+
+    async fn wait_for_rate_limit_reset_or_timeout(&self, account_key: &str, wait: Duration) {
+        if account_key.is_empty() || wait.is_zero() {
+            return;
+        }
+        let _ = tokio::time::timeout(wait, self.rate_limit_notify.notified()).await;
+    }
+
+    async fn defer_account_rate_limit(&self, account_key: &str, retry_after: Duration) {
+        if account_key.is_empty() {
+            return;
+        }
+        let next_allowed_at = Instant::now() + retry_after;
+        let mut states = self.rate_limit_states.lock().await;
+        let state = states.entry(account_key.to_string()).or_default();
+        if state
+            .next_allowed_at
+            .map_or(true, |current| current < next_allowed_at)
+        {
+            state.next_allowed_at = Some(next_allowed_at);
+        }
+    }
+
+    async fn reset_account_rate_limit(&self, account_key: &str) {
+        if account_key.is_empty() {
+            return;
+        }
+        let mut states = self.rate_limit_states.lock().await;
+        let state = states.entry(account_key.to_string()).or_default();
+        state.sent_at.clear();
+        state.next_allowed_at = None;
+        drop(states);
+        self.rate_limit_notify.notify_waiters();
+    }
+
+    async fn observe_context_for_interaction(&self, context: &WechatContext) {
+        let observed_at = SystemTime::now();
+        let expires_at = observed_at + self.rate_limit.context_ttl;
+        self.context_refresh_states.lock().await.insert(
+            (context.account_key.clone(), context.user_id.clone()),
+            ContextRefreshState {
+                user_id: context.user_id.clone(),
+                observed_at,
+                expires_at,
+                reminded: false,
+            },
+        );
+    }
+
+    async fn emit_due_context_interaction_requests(&self) {
+        if self.rate_limit.context_ttl.is_zero() {
+            return;
+        }
+        let now = SystemTime::now();
+        let mut events = Vec::new();
+        {
+            let mut contexts = self.context_refresh_states.lock().await;
+            contexts.retain(|_, state| !(state.reminded && now > state.expires_at));
+            for ((account_key, _), state) in contexts.iter_mut() {
+                if state.reminded {
+                    continue;
+                }
+                let remind_at = state
+                    .expires_at
+                    .checked_sub(self.rate_limit.context_remind_before)
+                    .unwrap_or(state.observed_at);
+                if now >= remind_at {
+                    state.reminded = true;
+                    events.push(WechatEvent::UserInteractionRequested {
+                        account_key: account_key.clone(),
+                        user_id: Some(state.user_id.clone()),
+                        reason: UserInteractionReason::ContextExpiring {
+                            observed_at: state.observed_at,
+                            expires_at: state.expires_at,
+                            remind_before: self.rate_limit.context_remind_before,
+                        },
+                    });
+                }
+            }
+        }
+        for event in events {
+            self.emit_event(event).await;
+        }
+    }
+
+    async fn record_successful_message_send(&self) {
+        let account_key = self.account_key().await;
+        if account_key.is_empty() || self.rate_limit.interaction_threshold == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut event = None;
+        {
+            let mut states = self.rate_limit_states.lock().await;
+            let state = states.entry(account_key.clone()).or_default();
+            while let Some(sent_at) = state.sent_at.front().copied() {
+                if now.duration_since(sent_at) > self.rate_limit.interaction_window {
+                    state.sent_at.pop_front();
+                } else {
+                    break;
+                }
+            }
+            state.sent_at.push_back(now);
+            let sent_count = state.sent_at.len();
+            if sent_count == self.rate_limit.interaction_threshold {
+                event = Some(WechatEvent::UserInteractionRequested {
+                    account_key,
+                    user_id: None,
+                    reason: UserInteractionReason::OutboundRateLimitApproaching {
+                        sent_count,
+                        window: self.rate_limit.interaction_window,
+                        threshold: self.rate_limit.interaction_threshold,
+                    },
+                });
+            }
+        }
+
+        if let Some(event) = event {
+            self.emit_event(event).await;
+        }
     }
 
     /// Stop the bot.
@@ -757,7 +1072,9 @@ impl WechatIlinkClient {
             vec![item],
             &client_id,
         );
-        self.client.send_message(base_url, token, &msg).await?;
+        self.retry_rate_limited(|| self.client.send_message(base_url, token, &msg))
+            .await?;
+        self.record_successful_message_send().await;
         Ok(SendReceipt::single(client_id))
     }
 
@@ -830,7 +1147,9 @@ impl WechatIlinkClient {
                 &chunk,
                 &client_id,
             );
-            self.client.send_message(&base_url, &token, &msg).await?;
+            self.retry_rate_limited(|| self.client.send_message(&base_url, &token, &msg))
+                .await?;
+            self.record_successful_message_send().await;
             message_ids.push(client_id);
             visible_texts.push(chunk);
         }
@@ -861,6 +1180,32 @@ impl WechatIlinkClient {
         if let Some(ref cb) = self.on_error {
             cb(err);
         }
+    }
+}
+
+fn rate_limited_error(retry_after: Duration) -> WechatIlinkError {
+    WechatIlinkError::RateLimited {
+        retry_after,
+        message: "ret=-2".to_string(),
+        http_status: 200,
+        errcode: -2,
+    }
+}
+
+fn with_rate_limit_retry_after(err: WechatIlinkError, retry_after: Duration) -> WechatIlinkError {
+    match err {
+        WechatIlinkError::RateLimited {
+            message,
+            http_status,
+            errcode,
+            ..
+        } => WechatIlinkError::RateLimited {
+            retry_after,
+            message,
+            http_status,
+            errcode,
+        },
+        other => other,
     }
 }
 
@@ -1206,6 +1551,185 @@ mod tests {
         assert_eq!(&*client.cursor.read().await, "stored-cursor");
     }
 
+    #[test]
+    fn rate_limit_builder_defaults_and_overrides_are_available() {
+        let default_options = WechatRateLimitOptions::default();
+        assert_eq!(default_options.retry_after, Duration::from_secs(90));
+        assert_eq!(default_options.retry_attempts, 5);
+        assert_eq!(default_options.interaction_window, Duration::from_secs(300));
+        assert_eq!(default_options.interaction_threshold, 6);
+        assert_eq!(
+            default_options.context_ttl,
+            Duration::from_secs(24 * 60 * 60)
+        );
+
+        let client = WechatIlinkClient::builder()
+            .rate_limit_retry_after(Duration::from_secs(60))
+            .rate_limit_max_retries(2)
+            .rate_limit_interaction_window(Duration::from_secs(120))
+            .rate_limit_interaction_threshold(4)
+            .context_ttl(Duration::from_secs(3600))
+            .context_expiry_remind_before(Duration::from_secs(300))
+            .build();
+
+        assert_eq!(client.rate_limit.retry_after, Duration::from_secs(60));
+        assert_eq!(client.rate_limit.retry_attempts, 2);
+        assert_eq!(
+            client.rate_limit.interaction_window,
+            Duration::from_secs(120)
+        );
+        assert_eq!(client.rate_limit.interaction_threshold, 4);
+        assert_eq!(client.rate_limit.context_ttl, Duration::from_secs(3600));
+        assert_eq!(
+            client.rate_limit.context_remind_before,
+            Duration::from_secs(300)
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_threshold_emits_interaction_event_and_incoming_resets_window() {
+        let client = WechatIlinkClient::builder()
+            .rate_limit_interaction_threshold(3)
+            .rate_limit_interaction_window(Duration::from_secs(300))
+            .build();
+        client.set_credentials(test_credentials()).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_handler = Arc::clone(&seen);
+        client
+            .on_event(Box::new(move |event| {
+                if let WechatEvent::UserInteractionRequested {
+                    account_key,
+                    reason:
+                        UserInteractionReason::OutboundRateLimitApproaching {
+                            sent_count,
+                            threshold,
+                            ..
+                        },
+                    ..
+                } = event
+                {
+                    seen_for_handler.lock().unwrap().push((
+                        account_key.clone(),
+                        *sent_count,
+                        *threshold,
+                    ));
+                }
+            }))
+            .await;
+
+        client.record_successful_message_send().await;
+        client.record_successful_message_send().await;
+        assert!(seen.lock().unwrap().is_empty());
+        client.record_successful_message_send().await;
+        assert_eq!(
+            &*seen.lock().unwrap(),
+            &[("account-1".to_string(), 3usize, 3usize)]
+        );
+        client.record_successful_message_send().await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        client.reset_account_rate_limit("account-1").await;
+        client.record_successful_message_send().await;
+        client.record_successful_message_send().await;
+        client.record_successful_message_send().await;
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn context_expiry_emits_user_interaction_event_and_new_context_resets_it() {
+        let client = WechatIlinkClient::builder()
+            .context_ttl(Duration::from_millis(5))
+            .context_expiry_remind_before(Duration::from_millis(5))
+            .build();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_handler = Arc::clone(&seen);
+        client
+            .on_event(Box::new(move |event| {
+                if let WechatEvent::UserInteractionRequested {
+                    account_key,
+                    user_id,
+                    reason: UserInteractionReason::ContextExpiring { .. },
+                } = event
+                {
+                    seen_for_handler
+                        .lock()
+                        .unwrap()
+                        .push((account_key.clone(), user_id.clone()));
+                }
+            }))
+            .await;
+
+        let context = WechatContext {
+            account_key: "account-1".to_string(),
+            user_id: "user-1".to_string(),
+            context_token: "ctx-1".to_string(),
+            observed_at_unix_ms: 1,
+            source_message_id: Some("msg-1".to_string()),
+        };
+        client.observe_context_for_interaction(&context).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        client.emit_due_context_interaction_requests().await;
+        assert_eq!(
+            &*seen.lock().unwrap(),
+            &[("account-1".to_string(), Some("user-1".to_string()))]
+        );
+
+        client.observe_context_for_interaction(&context).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        client.emit_due_context_interaction_requests().await;
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_rate_limited_uses_configured_retry_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let client = WechatIlinkClient::builder()
+            .rate_limit_retry_after(Duration::from_millis(1))
+            .rate_limit_max_retries(2)
+            .build();
+        client.set_credentials(test_credentials()).await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_operation = Arc::clone(&attempts);
+
+        let err = client
+            .retry_rate_limited(move || {
+                let attempts_for_operation = Arc::clone(&attempts_for_operation);
+                async move {
+                    attempts_for_operation.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(rate_limited_error(Duration::from_millis(1)))
+                }
+            })
+            .await
+            .expect_err("rate limit should remain after configured retries");
+
+        assert!(err.is_rate_limited());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn active_rate_limit_backoff_returns_error_without_queueing_new_request() {
+        let client = WechatIlinkClient::builder()
+            .rate_limit_retry_after(Duration::from_secs(90))
+            .build();
+        client.set_credentials(test_credentials()).await;
+        client
+            .defer_account_rate_limit("account-1", Duration::from_secs(90))
+            .await;
+
+        let mut called = false;
+        let err = client
+            .retry_rate_limited(|| {
+                called = true;
+                async { Ok::<_, WechatIlinkError>(()) }
+            })
+            .await
+            .expect_err("active backoff should return immediately");
+
+        assert!(!called);
+        assert!(err.is_rate_limited());
+    }
+
     #[tokio::test]
     async fn event_handler_accepts_context_observed_and_cursor_events() {
         let client = WechatIlinkClient::new();
@@ -1221,6 +1745,14 @@ mod tests {
                     WechatEvent::AuthSessionExpired { account_key } => {
                         format!("auth:{account_key}")
                     }
+                    WechatEvent::UserInteractionRequested { reason, .. } => match reason {
+                        UserInteractionReason::OutboundRateLimitApproaching {
+                            sent_count, ..
+                        } => {
+                            format!("rate-limit:{sent_count}")
+                        }
+                        UserInteractionReason::ContextExpiring { .. } => "context-expiring".into(),
+                    },
                 });
             }))
             .await;
@@ -1247,18 +1779,20 @@ mod tests {
         );
     }
 
+    fn test_credentials() -> Credentials {
+        Credentials {
+            token: "token-1".into(),
+            base_url: "https://example.invalid".into(),
+            account_id: "account-1".into(),
+            user_id: "bot-1".into(),
+            saved_at: None,
+        }
+    }
+
     #[tokio::test]
     async fn credentials_are_supplied_by_caller() {
         let client = WechatIlinkClient::new();
-        client
-            .set_credentials(Credentials {
-                token: "token-1".into(),
-                base_url: "https://example.invalid".into(),
-                account_id: "account-1".into(),
-                user_id: "bot-1".into(),
-                saved_at: None,
-            })
-            .await;
+        client.set_credentials(test_credentials()).await;
 
         let creds = client.credentials().await.unwrap();
         assert_eq!(creds.account_id, "account-1");
