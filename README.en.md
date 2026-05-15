@@ -1,5 +1,10 @@
 # wechat-ilink
 
+[![crates.io](https://img.shields.io/crates/v/wechat-ilink.svg)](https://crates.io/crates/wechat-ilink)
+[![docs.rs](https://docs.rs/wechat-ilink/badge.svg)](https://docs.rs/wechat-ilink)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![rust: 2021](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
+
 Stream-first async WeChat iLink protocol client for Rust. Builder-based, event-driven, and fully stateless — your app owns credentials, context tokens, and cursors. Handles QR login, event-driven polling, automatic context refresh from incoming messages, typed rate limiting with automatic backoff, and context-expiry interaction events.
 
 中文：[README.md](README.md)

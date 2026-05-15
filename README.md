@@ -1,5 +1,10 @@
 # wechat-ilink
 
+[![crates.io](https://img.shields.io/crates/v/wechat-ilink.svg)](https://crates.io/crates/wechat-ilink)
+[![docs.rs](https://docs.rs/wechat-ilink/badge.svg)](https://docs.rs/wechat-ilink)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![rust: 2021](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
+
 非官方 WeChat iLink 协议客户端：stream-first API · QR 登录 · 事件驱动轮询 · 自动从入站消息观测并刷新 context · 类型化速率限制（ret=-2）与自动退避 · context TTL 过期交互事件 · 显式 context 发送文本/媒体/typing · CDN 上传/下载。全无状态 —— 所有 credentials / context / cursor 由应用管理。
 
 English: [README.en.md](README.en.md)
