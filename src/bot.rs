@@ -1,11 +1,15 @@
 //! Main WechatIlinkClient.
 
+use futures_core::Stream;
+use futures_util::StreamExt;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -19,11 +23,7 @@ use rand::Rng;
 use serde_json::json;
 use uuid::Uuid;
 
-/// Message handler callback type.
-pub type MessageHandler = Box<dyn Fn(&IncomingMessage) + Send + Sync>;
-
-/// Event handler callback type.
-pub type EventHandler = Box<dyn Fn(&WechatEvent) + Send + Sync>;
+const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Lifecycle events emitted by the WeChat iLink client.
 #[derive(Debug, Clone)]
@@ -96,6 +96,89 @@ pub enum UserInteractionReason {
     },
 }
 
+/// A stream of WeChat lifecycle events.
+pub struct WechatEventStream<'a> {
+    inner: Pin<Box<dyn Stream<Item = Result<WechatEvent>> + Send + 'a>>,
+}
+
+impl<'a> WechatEventStream<'a> {
+    fn new(stream: impl Stream<Item = Result<WechatEvent>> + Send + 'a) -> Self {
+        Self {
+            inner: Box::pin(stream),
+        }
+    }
+
+    pub async fn next(&mut self) -> Option<Result<WechatEvent>> {
+        self.inner.next().await
+    }
+}
+
+impl Stream for WechatEventStream<'_> {
+    type Item = Result<WechatEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// Events emitted during QR login.
+#[derive(Debug)]
+pub enum LoginQrEvent {
+    /// A new QR code should be displayed or rendered by the application.
+    QrCode { content: String },
+    /// Login status changed.
+    StatusChanged { status: String },
+    /// WeChat requires a verification code before continuing.
+    NeedVerifyCode {
+        prompt: String,
+        responder: VerifyCodeResponder,
+    },
+    /// Login completed and credentials were installed into the client.
+    Confirmed { credentials: Credentials },
+}
+
+/// One-shot responder for [`LoginQrEvent::NeedVerifyCode`].
+#[derive(Debug)]
+pub struct VerifyCodeResponder {
+    tx: oneshot::Sender<Option<String>>,
+}
+
+impl VerifyCodeResponder {
+    pub fn send(self, code: impl Into<String>) -> std::result::Result<(), Option<String>> {
+        let code = Some(code.into());
+        self.tx.send(code)
+    }
+
+    pub fn cancel(self) -> std::result::Result<(), Option<String>> {
+        self.tx.send(None)
+    }
+}
+
+/// A stream of QR login events.
+pub struct LoginQrStream<'a> {
+    inner: Pin<Box<dyn Stream<Item = Result<LoginQrEvent>> + Send + 'a>>,
+}
+
+impl<'a> LoginQrStream<'a> {
+    fn new(stream: impl Stream<Item = Result<LoginQrEvent>> + Send + 'a) -> Self {
+        Self {
+            inner: Box::pin(stream),
+        }
+    }
+
+    pub async fn next(&mut self) -> Option<Result<LoginQrEvent>> {
+        self.inner.next().await
+    }
+}
+
+impl Stream for LoginQrStream<'_> {
+    type Item = Result<LoginQrEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
 /// Rate-limit and context-refresh policy for iLink requests.
 #[derive(Debug, Clone)]
 pub struct WechatRateLimitOptions {
@@ -148,9 +231,6 @@ pub struct WechatIlinkClientBuilder {
     markdown_filter: bool,
     rate_limit: WechatRateLimitOptions,
     credentials: Option<Credentials>,
-    on_qr_url: Option<Box<dyn Fn(&str) + Send + Sync>>,
-    on_verify_code: Option<Box<dyn Fn(&str) -> Option<String> + Send + Sync>>,
-    on_error: Option<Box<dyn Fn(&WechatIlinkError) + Send + Sync>>,
 }
 
 impl Default for WechatIlinkClientBuilder {
@@ -163,9 +243,6 @@ impl Default for WechatIlinkClientBuilder {
             markdown_filter: true,
             rate_limit: WechatRateLimitOptions::default(),
             credentials: None,
-            on_qr_url: None,
-            on_verify_code: None,
-            on_error: None,
         }
     }
 }
@@ -249,30 +326,6 @@ impl WechatIlinkClientBuilder {
         self
     }
 
-    pub fn on_qr_url<F>(mut self, on_qr_url: F) -> Self
-    where
-        F: Fn(&str) + Send + Sync + 'static,
-    {
-        self.on_qr_url = Some(Box::new(on_qr_url));
-        self
-    }
-
-    pub fn on_verify_code<F>(mut self, on_verify_code: F) -> Self
-    where
-        F: Fn(&str) -> Option<String> + Send + Sync + 'static,
-    {
-        self.on_verify_code = Some(Box::new(on_verify_code));
-        self
-    }
-
-    pub fn on_error<F>(mut self, on_error: F) -> Self
-    where
-        F: Fn(&WechatIlinkError) + Send + Sync + 'static,
-    {
-        self.on_error = Some(Box::new(on_error));
-        self
-    }
-
     pub fn build(self) -> WechatIlinkClient {
         WechatIlinkClient::from_builder(self)
     }
@@ -283,18 +336,13 @@ pub struct WechatIlinkClient {
     client: Arc<ILinkClient>,
     cdn: CdnClient,
     credentials: RwLock<Option<Credentials>>,
-    handlers: Mutex<Vec<MessageHandler>>,
-    event_handlers: Mutex<Vec<EventHandler>>,
+    event_tx: broadcast::Sender<WechatEvent>,
     rate_limit_states: Mutex<HashMap<String, AccountRateLimitState>>,
     context_refresh_states: Mutex<HashMap<(String, String), ContextRefreshState>>,
     rate_limit_notify: Notify,
-    cursor: RwLock<String>,
     base_url: RwLock<String>,
     stopped: RwLock<bool>,
     rate_limit: WechatRateLimitOptions,
-    on_qr_url: Option<Box<dyn Fn(&str) + Send + Sync>>,
-    on_verify_code: Option<Box<dyn Fn(&str) -> Option<String> + Send + Sync>>,
-    on_error: Option<Box<dyn Fn(&WechatIlinkError) + Send + Sync>>,
 }
 
 impl WechatIlinkClient {
@@ -324,18 +372,13 @@ impl WechatIlinkClient {
             })),
             cdn: CdnClient::new(),
             credentials: RwLock::new(builder.credentials),
-            handlers: Mutex::new(Vec::new()),
-            event_handlers: Mutex::new(Vec::new()),
+            event_tx: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
             rate_limit_states: Mutex::new(HashMap::new()),
             context_refresh_states: Mutex::new(HashMap::new()),
             rate_limit_notify: Notify::new(),
-            cursor: RwLock::new(String::new()),
             base_url: RwLock::new(base_url),
             stopped: RwLock::new(false),
             rate_limit: builder.rate_limit,
-            on_qr_url: builder.on_qr_url,
-            on_verify_code: builder.on_verify_code,
-            on_error: builder.on_error,
         }
     }
 
@@ -355,154 +398,211 @@ impl WechatIlinkClient {
         self.credentials.read().await.clone()
     }
 
-    /// Login via QR code. Returns credentials on success.
+    /// Start QR login and return a stream of login events.
     ///
-    /// The caller owns persistence of returned credentials.
-    pub async fn login_qr(&self) -> Result<Credentials> {
-        let base_url = self.base_url.read().await.clone();
-
-        // QR code login flow
-        let mut qr_refresh_count = 0u32;
-        loop {
-            qr_refresh_count += 1;
-            if qr_refresh_count > Self::MAX_QR_REFRESH {
-                return Err(WechatIlinkError::Auth(format!(
-                    "QR code expired {} times — login aborted",
-                    Self::MAX_QR_REFRESH
-                )));
-            }
-
-            let qr = self.client.get_qr_code(Self::FIXED_QR_BASE_URL).await?;
-
-            if let Some(ref cb) = self.on_qr_url {
-                cb(&qr.qrcode_img_content);
-            } else {
-                eprintln!("[wechat-ilink] Scan: {}", qr.qrcode_img_content);
-            }
-
-            let mut last_status = String::new();
-            let mut current_poll_base_url = Self::FIXED_QR_BASE_URL.to_string();
-            let mut pending_verify_code: Option<String> = None;
+    /// Applications display [`LoginQrEvent::QrCode`], optionally answer
+    /// [`LoginQrEvent::NeedVerifyCode`], and persist credentials from
+    /// [`LoginQrEvent::Confirmed`].
+    pub fn login_qr_stream(&self) -> LoginQrStream<'_> {
+        LoginQrStream::new(async_stream::stream! {
+            let base_url = self.base_url.read().await.clone();
+            let mut qr_refresh_count = 0u32;
             loop {
-                let status = self
-                    .client
-                    .poll_qr_status_with_verify_code(
-                        &current_poll_base_url,
-                        &qr.qrcode,
-                        pending_verify_code.as_deref(),
-                    )
-                    .await?;
+                qr_refresh_count += 1;
+                if qr_refresh_count > Self::MAX_QR_REFRESH {
+                    yield Err(WechatIlinkError::Auth(format!(
+                        "QR code expired {} times — login aborted",
+                        Self::MAX_QR_REFRESH
+                    )));
+                    return;
+                }
 
-                if status.status != last_status {
-                    last_status = status.status.clone();
-                    match status.status.as_str() {
-                        "scaned" => info!("QR scanned — confirm in WeChat"),
-                        "expired" => warn!("QR expired — requesting new one"),
-                        "confirmed" => info!("Login confirmed"),
-                        "need_verifycode" => info!("QR verification code required"),
-                        "verify_code_blocked" => warn!("QR verification code blocked"),
-                        "binded_redirect" => warn!("QR already bound"),
-                        _ => {}
+                let qr = match self.client.get_qr_code(Self::FIXED_QR_BASE_URL).await {
+                    Ok(qr) => qr,
+                    Err(err) => {
+                        yield Err(err);
+                        return;
                     }
-                }
+                };
+                yield Ok(LoginQrEvent::QrCode {
+                    content: qr.qrcode_img_content.clone(),
+                });
 
-                if status.status == "wait" {
-                    sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
+                let mut last_status = String::new();
+                let mut current_poll_base_url = Self::FIXED_QR_BASE_URL.to_string();
+                let mut pending_verify_code: Option<String> = None;
+                loop {
+                    let status = match self
+                        .client
+                        .poll_qr_status_with_verify_code(
+                            &current_poll_base_url,
+                            &qr.qrcode,
+                            pending_verify_code.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(status) => status,
+                        Err(err) => {
+                            yield Err(err);
+                            return;
+                        }
+                    };
 
-                if status.status == "need_verifycode" {
-                    let Some(ref on_verify_code) = self.on_verify_code else {
-                        return Err(WechatIlinkError::Auth(
-                            "QR verification code required".into(),
+                    if status.status != last_status {
+                        last_status = status.status.clone();
+                        match status.status.as_str() {
+                            "scaned" => info!("QR scanned — confirm in WeChat"),
+                            "expired" => warn!("QR expired — requesting new one"),
+                            "confirmed" => info!("Login confirmed"),
+                            "need_verifycode" => info!("QR verification code required"),
+                            "verify_code_blocked" => warn!("QR verification code blocked"),
+                            "binded_redirect" => warn!("QR already bound"),
+                            _ => {}
+                        }
+                        yield Ok(LoginQrEvent::StatusChanged {
+                            status: status.status.clone(),
+                        });
+                    }
+
+                    if status.status == "wait" {
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+
+                    if status.status == "need_verifycode" {
+                        let prompt = if pending_verify_code.is_some() {
+                            "QR verification code mismatch"
+                        } else {
+                            "QR verification code required"
+                        };
+                        let (tx, rx) = oneshot::channel();
+                        yield Ok(LoginQrEvent::NeedVerifyCode {
+                            prompt: prompt.to_string(),
+                            responder: VerifyCodeResponder { tx },
+                        });
+                        let code = match rx.await {
+                            Ok(Some(value)) => value.trim().to_string(),
+                            _ => String::new(),
+                        };
+                        if code.is_empty() {
+                            yield Err(WechatIlinkError::Auth(
+                                "QR verification code was not provided".into(),
+                            ));
+                            return;
+                        }
+                        pending_verify_code = Some(code);
+                        continue;
+                    }
+
+                    if status.status == "verify_code_blocked" {
+                        break;
+                    }
+
+                    if status.status == "binded_redirect" {
+                        yield Err(WechatIlinkError::Auth(
+                            "QR login is already bound to this app".into(),
                         ));
-                    };
-                    let prompt = if pending_verify_code.is_some() {
-                        "QR verification code mismatch"
-                    } else {
-                        "QR verification code required"
-                    };
-                    let code = on_verify_code(prompt)
-                        .map(|value| value.trim().to_string())
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| {
-                            WechatIlinkError::Auth("QR verification code was not provided".into())
-                        })?;
-                    pending_verify_code = Some(code);
-                    continue;
-                }
-
-                if status.status == "verify_code_blocked" {
-                    break;
-                }
-
-                if status.status == "binded_redirect" {
-                    return Err(WechatIlinkError::Auth(
-                        "QR login is already bound to this app".into(),
-                    ));
-                }
-
-                if status.status == "confirmed" {
-                    let token = status
-                        .bot_token
-                        .ok_or_else(|| WechatIlinkError::Auth("missing bot_token".into()))?;
-                    let creds = Credentials {
-                        token,
-                        base_url: status.baseurl.unwrap_or_else(|| base_url.clone()),
-                        account_id: status.ilink_bot_id.unwrap_or_default(),
-                        user_id: status.ilink_user_id.unwrap_or_default(),
-                        saved_at: Some(chrono_now()),
-                    };
-                    *self.credentials.write().await = Some(creds.clone());
-                    *self.base_url.write().await = creds.base_url.clone();
-                    return Ok(creds);
-                }
-
-                // Handle IDC redirect
-                if status.status == "scaned_but_redirect" {
-                    if let Some(ref host) = status.redirect_host {
-                        current_poll_base_url = format!("https://{}", host);
-                        info!("IDC redirect, switching polling host to {}", host);
-                    } else {
-                        warn!("Received scaned_but_redirect but redirect_host is missing");
+                        return;
                     }
+
+                    if status.status == "confirmed" {
+                        let token = match status.bot_token {
+                            Some(token) => token,
+                            None => {
+                                yield Err(WechatIlinkError::Auth("missing bot_token".into()));
+                                return;
+                            }
+                        };
+                        let creds = Credentials {
+                            token,
+                            base_url: status.baseurl.unwrap_or_else(|| base_url.clone()),
+                            account_id: status.ilink_bot_id.unwrap_or_default(),
+                            user_id: status.ilink_user_id.unwrap_or_default(),
+                            saved_at: Some(chrono_now()),
+                        };
+                        *self.credentials.write().await = Some(creds.clone());
+                        *self.base_url.write().await = creds.base_url.clone();
+                        yield Ok(LoginQrEvent::Confirmed { credentials: creds });
+                        return;
+                    }
+
+                    if status.status == "scaned_but_redirect" {
+                        if let Some(ref host) = status.redirect_host {
+                            current_poll_base_url = format!("https://{}", host);
+                            info!("IDC redirect, switching polling host to {}", host);
+                        } else {
+                            warn!("Received scaned_but_redirect but redirect_host is missing");
+                        }
+                        sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+
+                    if status.status == "scaned" && pending_verify_code.is_some() {
+                        pending_verify_code = None;
+                    }
+
+                    if status.status == "expired" {
+                        break;
+                    }
+
                     sleep(Duration::from_secs(2)).await;
-                    continue;
                 }
-
-                if status.status == "scaned" && pending_verify_code.is_some() {
-                    pending_verify_code = None;
-                }
-
-                if status.status == "expired" {
-                    break;
-                }
-
-                sleep(Duration::from_secs(2)).await;
             }
-        }
+        })
     }
 
-    /// Register a message handler.
-    pub async fn on_message(&self, handler: MessageHandler) {
-        self.handlers.lock().await.push(handler);
+    /// Subscribe to events emitted by polling and outbound-send bookkeeping.
+    pub fn event_stream(&self) -> WechatEventStream<'static> {
+        event_stream_from_receiver(self.event_tx.subscribe())
     }
 
-    /// Register an event handler.
-    ///
-    /// Event handlers receive lifecycle events emitted during polling:
-    /// [`WechatEvent::ContextObserved`], [`WechatEvent::Message`],
-    /// [`WechatEvent::CursorAdvanced`], and [`WechatEvent::AuthSessionExpired`].
-    pub async fn on_event(&self, handler: EventHandler) {
-        self.event_handlers.lock().await.push(handler);
+    /// Start polling from an externally persisted cursor and stream resulting events.
+    pub fn stream_from_cursor(
+        self: Arc<Self>,
+        cursor: Option<String>,
+    ) -> WechatEventStream<'static> {
+        let mut rx = self.event_tx.subscribe();
+        let runner = Arc::clone(&self);
+        let mut task =
+            tokio::spawn(async move { runner.run_loop(cursor.unwrap_or_default()).await });
+        let abort_on_drop = AbortOnDrop(task.abort_handle());
+        WechatEventStream::new(async_stream::stream! {
+            let _abort_on_drop = abort_on_drop;
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut task => {
+                        match result {
+                            Ok(Ok(())) => return,
+                            Ok(Err(err)) => {
+                                yield Err(err);
+                                return;
+                            }
+                            Err(err) => {
+                                yield Err(WechatIlinkError::Other(format!(
+                                    "wechat poll task failed: {err}"
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                    event = rx.recv() => match event {
+                        Ok(event) => yield Ok(event),
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            yield Err(WechatIlinkError::Other(format!(
+                                "wechat event stream lagged by {skipped} events"
+                            )));
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            }
+        })
     }
 
-    /// Emit an event to all registered event handlers.
-    async fn emit_event(&self, event: WechatEvent) {
-        let handlers = self.event_handlers.lock().await;
-        for handler in handlers.iter() {
-            handler(&event);
-        }
+    /// Emit an event to active streams.
+    fn emit_event(&self, event: WechatEvent) {
+        let _ = self.event_tx.send(event);
     }
 
     /// Reply to an incoming message using its observed context.
@@ -653,22 +753,7 @@ impl WechatIlinkClient {
             .await
     }
 
-    /// Start the long-poll loop with an explicit starting cursor.
-    ///
-    /// Uses a process-local cursor for this run. The cursor, observed contexts,
-    /// and reminder metadata are not persisted by this method; the caller is
-    /// responsible for saving state from emitted events.
-    pub async fn run_from_cursor(&self, cursor: Option<String>) -> Result<()> {
-        self.run_loop(cursor.unwrap_or_default(), false).await
-    }
-
-    /// Start the long-poll loop. Blocks until stopped.
-    pub async fn run(&self) -> Result<()> {
-        let cursor = self.cursor.read().await.clone();
-        self.run_loop(cursor, true).await
-    }
-
-    async fn run_loop(&self, mut cursor: String, persist_legacy_state: bool) -> Result<()> {
+    async fn run_loop(&self, mut cursor: String) -> Result<()> {
         *self.stopped.write().await = false;
         info!("Long-poll loop started");
         let mut retry_delay = Duration::from_secs(1);
@@ -699,9 +784,6 @@ impl WechatIlinkClient {
                     if !new_cursor.is_empty() && cursor.as_str() != new_cursor.as_str() {
                         cursor_changed = true;
                         cursor = new_cursor.clone();
-                        if persist_legacy_state {
-                            *self.cursor.write().await = new_cursor.clone();
-                        }
                     }
                     retry_delay = Duration::from_secs(1);
 
@@ -712,14 +794,9 @@ impl WechatIlinkClient {
                             self.reset_account_rate_limit(&account_key).await;
                             if let Some(context) = incoming.context.clone() {
                                 self.observe_context_for_interaction(&context).await;
-                                self.emit_event(WechatEvent::ContextObserved(context)).await;
+                                self.emit_event(WechatEvent::ContextObserved(context));
                             }
-                            self.emit_event(WechatEvent::Message(incoming.clone()))
-                                .await;
-                            let handlers = self.handlers.lock().await;
-                            for handler in handlers.iter() {
-                                handler(&incoming);
-                            }
+                            self.emit_event(WechatEvent::Message(incoming.clone()));
                         }
                     }
                     self.emit_due_context_interaction_requests().await;
@@ -727,8 +804,7 @@ impl WechatIlinkClient {
                         self.emit_event(WechatEvent::CursorAdvanced {
                             account_key: account_key.clone(),
                             cursor: new_cursor.clone(),
-                        })
-                        .await;
+                        });
                     }
                 }
                 Err(e) if e.is_session_expired() => {
@@ -736,16 +812,9 @@ impl WechatIlinkClient {
                     let account_key = self.account_key().await;
                     self.emit_event(WechatEvent::AuthSessionExpired {
                         account_key: account_key.clone(),
-                    })
-                    .await;
+                    });
                     cursor.clear();
-                    if persist_legacy_state {
-                        *self.cursor.write().await = String::new();
-                    }
-                    if let Err(e) = self.login_qr().await {
-                        self.report_error(&e);
-                    }
-                    continue;
+                    break;
                 }
                 Err(e) if e.is_rate_limited() => {
                     self.report_error(&e);
@@ -907,7 +976,7 @@ impl WechatIlinkClient {
             }
         }
         for event in events {
-            self.emit_event(event).await;
+            self.emit_event(event);
         }
     }
 
@@ -945,7 +1014,7 @@ impl WechatIlinkClient {
         }
 
         if let Some(event) = event {
-            self.emit_event(event).await;
+            self.emit_event(event);
         }
     }
 
@@ -1177,9 +1246,32 @@ impl WechatIlinkClient {
 
     fn report_error(&self, err: &WechatIlinkError) {
         error!("{}", err);
-        if let Some(ref cb) = self.on_error {
-            cb(err);
+    }
+}
+
+fn event_stream_from_receiver(
+    mut rx: broadcast::Receiver<WechatEvent>,
+) -> WechatEventStream<'static> {
+    WechatEventStream::new(async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(event) => yield Ok(event),
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    yield Err(WechatIlinkError::Other(format!(
+                        "wechat event stream lagged by {skipped} events"
+                    )));
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
         }
+    })
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -1355,7 +1447,7 @@ fn context_account_key(creds: &Credentials) -> &str {
 }
 
 fn chrono_now() -> String {
-    // Simple ISO 8601 without chrono dependency
+    // Lightweight timestamp string without a chrono dependency.
     let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     format!("{}Z", dur.as_secs())
 }
@@ -1525,30 +1617,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursor_is_process_local_until_adapter_store_migrates() {
-        let root = std::env::temp_dir().join(format!("wechat-ilink-test-{}", Uuid::new_v4()));
+    async fn stream_from_cursor_reports_missing_auth_without_storing_cursor() {
+        let client = Arc::new(WechatIlinkClient::new());
+        let mut events = client.stream_from_cursor(Some("external-cursor".to_string()));
 
-        let bot = WechatIlinkClient::new();
-        *bot.cursor.write().await = "cursor-1".to_string();
-        assert!(!root.join("cursors.json").exists());
+        let err = events
+            .next()
+            .await
+            .expect("stream item")
+            .expect_err("missing auth should be surfaced through stream");
 
-        let restored = WechatIlinkClient::new();
-        assert_eq!(restored.cursor.read().await.as_str(), "");
-
-        let _ = tokio::fs::remove_dir_all(root).await;
-    }
-
-    #[tokio::test]
-    async fn run_from_cursor_does_not_mutate_stored_cursor_before_polling() {
-        let client = WechatIlinkClient::new();
-        *client.cursor.write().await = "stored-cursor".to_string();
-
-        let result = client
-            .run_from_cursor(Some("external-cursor".to_string()))
-            .await;
-
-        assert!(matches!(result, Err(WechatIlinkError::Auth(_))));
-        assert_eq!(&*client.cursor.read().await, "stored-cursor");
+        assert!(matches!(err, WechatIlinkError::Auth(_)));
     }
 
     #[test]
@@ -1593,46 +1672,29 @@ mod tests {
             .rate_limit_interaction_window(Duration::from_secs(300))
             .build();
         client.set_credentials(test_credentials()).await;
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen_for_handler = Arc::clone(&seen);
-        client
-            .on_event(Box::new(move |event| {
-                if let WechatEvent::UserInteractionRequested {
-                    account_key,
-                    reason:
-                        UserInteractionReason::OutboundRateLimitApproaching {
-                            sent_count,
-                            threshold,
-                            ..
-                        },
-                    ..
-                } = event
-                {
-                    seen_for_handler.lock().unwrap().push((
-                        account_key.clone(),
-                        *sent_count,
-                        *threshold,
-                    ));
-                }
-            }))
-            .await;
+        let mut events = client.event_stream();
 
         client.record_successful_message_send().await;
         client.record_successful_message_send().await;
-        assert!(seen.lock().unwrap().is_empty());
-        client.record_successful_message_send().await;
-        assert_eq!(
-            &*seen.lock().unwrap(),
-            &[("account-1".to_string(), 3usize, 3usize)]
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), events.next())
+                .await
+                .is_err()
         );
         client.record_successful_message_send().await;
-        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_rate_limit_event(events.next().await, "account-1", 3, 3);
+        client.record_successful_message_send().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), events.next())
+                .await
+                .is_err()
+        );
 
         client.reset_account_rate_limit("account-1").await;
         client.record_successful_message_send().await;
         client.record_successful_message_send().await;
         client.record_successful_message_send().await;
-        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_rate_limit_event(events.next().await, "account-1", 3, 3);
     }
 
     #[tokio::test]
@@ -1641,23 +1703,7 @@ mod tests {
             .context_ttl(Duration::from_millis(5))
             .context_expiry_remind_before(Duration::from_millis(5))
             .build();
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen_for_handler = Arc::clone(&seen);
-        client
-            .on_event(Box::new(move |event| {
-                if let WechatEvent::UserInteractionRequested {
-                    account_key,
-                    user_id,
-                    reason: UserInteractionReason::ContextExpiring { .. },
-                } = event
-                {
-                    seen_for_handler
-                        .lock()
-                        .unwrap()
-                        .push((account_key.clone(), user_id.clone()));
-                }
-            }))
-            .await;
+        let mut events = client.event_stream();
 
         let context = WechatContext {
             account_key: "account-1".to_string(),
@@ -1669,15 +1715,12 @@ mod tests {
         client.observe_context_for_interaction(&context).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
         client.emit_due_context_interaction_requests().await;
-        assert_eq!(
-            &*seen.lock().unwrap(),
-            &[("account-1".to_string(), Some("user-1".to_string()))]
-        );
+        assert_context_expiring_event(events.next().await, "account-1", "user-1");
 
         client.observe_context_for_interaction(&context).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
         client.emit_due_context_interaction_requests().await;
-        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_context_expiring_event(events.next().await, "account-1", "user-1");
     }
 
     #[tokio::test]
@@ -1731,52 +1774,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_handler_accepts_context_observed_and_cursor_events() {
+    async fn event_stream_accepts_context_observed_and_cursor_events() {
         let client = WechatIlinkClient::new();
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen_for_handler = Arc::clone(&seen);
+        let mut events = client.event_stream();
 
-        client
-            .on_event(Box::new(move |event| {
-                seen_for_handler.lock().unwrap().push(match event {
-                    WechatEvent::ContextObserved(ctx) => format!("context:{}", ctx.user_id),
-                    WechatEvent::CursorAdvanced { cursor, .. } => format!("cursor:{cursor}"),
-                    WechatEvent::Message(msg) => format!("message:{}", msg.user_id),
-                    WechatEvent::AuthSessionExpired { account_key } => {
-                        format!("auth:{account_key}")
-                    }
-                    WechatEvent::UserInteractionRequested { reason, .. } => match reason {
-                        UserInteractionReason::OutboundRateLimitApproaching {
-                            sent_count, ..
-                        } => {
-                            format!("rate-limit:{sent_count}")
-                        }
-                        UserInteractionReason::ContextExpiring { .. } => "context-expiring".into(),
+        client.emit_event(WechatEvent::ContextObserved(WechatContext {
+            account_key: "account-1".to_string(),
+            user_id: "user-1".to_string(),
+            context_token: "ctx-1".to_string(),
+            observed_at_unix_ms: 1,
+            source_message_id: Some("msg-1".to_string()),
+        }));
+        client.emit_event(WechatEvent::CursorAdvanced {
+            account_key: "account-1".to_string(),
+            cursor: "cursor-2".to_string(),
+        });
+
+        assert_eq!(format_event(events.next().await), "context:user-1");
+        assert_eq!(format_event(events.next().await), "cursor:cursor-2");
+    }
+
+    fn assert_rate_limit_event(
+        event: Option<Result<WechatEvent>>,
+        expected_account: &str,
+        expected_sent_count: usize,
+        expected_threshold: usize,
+    ) {
+        match event.expect("event").expect("ok event") {
+            WechatEvent::UserInteractionRequested {
+                account_key,
+                reason:
+                    UserInteractionReason::OutboundRateLimitApproaching {
+                        sent_count,
+                        threshold,
+                        ..
                     },
-                });
-            }))
-            .await;
+                ..
+            } => {
+                assert_eq!(account_key, expected_account);
+                assert_eq!(sent_count, expected_sent_count);
+                assert_eq!(threshold, expected_threshold);
+            }
+            other => panic!("expected rate-limit interaction event, got {other:?}"),
+        }
+    }
 
-        client
-            .emit_event(WechatEvent::ContextObserved(WechatContext {
-                account_key: "account-1".to_string(),
-                user_id: "user-1".to_string(),
-                context_token: "ctx-1".to_string(),
-                observed_at_unix_ms: 1,
-                source_message_id: Some("msg-1".to_string()),
-            }))
-            .await;
-        client
-            .emit_event(WechatEvent::CursorAdvanced {
-                account_key: "account-1".to_string(),
-                cursor: "cursor-2".to_string(),
-            })
-            .await;
+    fn assert_context_expiring_event(
+        event: Option<Result<WechatEvent>>,
+        expected_account: &str,
+        expected_user: &str,
+    ) {
+        match event.expect("event").expect("ok event") {
+            WechatEvent::UserInteractionRequested {
+                account_key,
+                user_id,
+                reason: UserInteractionReason::ContextExpiring { .. },
+            } => {
+                assert_eq!(account_key, expected_account);
+                assert_eq!(user_id.as_deref(), Some(expected_user));
+            }
+            other => panic!("expected context-expiring interaction event, got {other:?}"),
+        }
+    }
 
-        assert_eq!(
-            &*seen.lock().unwrap(),
-            &["context:user-1", "cursor:cursor-2"]
-        );
+    fn format_event(event: Option<Result<WechatEvent>>) -> String {
+        match event.expect("event").expect("ok event") {
+            WechatEvent::ContextObserved(ctx) => format!("context:{}", ctx.user_id),
+            WechatEvent::CursorAdvanced { cursor, .. } => format!("cursor:{cursor}"),
+            WechatEvent::Message(msg) => format!("message:{}", msg.user_id),
+            WechatEvent::AuthSessionExpired { account_key } => format!("auth:{account_key}"),
+            WechatEvent::UserInteractionRequested { reason, .. } => match reason {
+                UserInteractionReason::OutboundRateLimitApproaching { sent_count, .. } => {
+                    format!("rate-limit:{sent_count}")
+                }
+                UserInteractionReason::ContextExpiring { .. } => "context-expiring".into(),
+            },
+        }
     }
 
     fn test_credentials() -> Credentials {

@@ -7,7 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use wechat_ilink::{Credentials, WechatContext, WechatEvent, WechatIlinkClient};
+use wechat_ilink::{Credentials, LoginQrEvent, WechatContext, WechatEvent, WechatIlinkClient};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct StoreFile {
@@ -142,53 +142,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             client.set_credentials(creds.clone()).await;
             creds
         }
-        None => {
-            let creds = client.login_qr().await?;
-            store.save_credentials(creds.clone()).await?;
-            creds
-        }
+        None => login_and_save(&client, &store).await?,
     };
     let account_key = if creds.account_id.is_empty() {
         creds.user_id.clone()
     } else {
         creds.account_id.clone()
     };
-
-    let event_store = store.clone();
-    client
-        .on_event(Box::new(move |event| {
-            let event_store = event_store.clone();
-            let event = event.clone();
-            tokio::spawn(async move {
-                match event {
-                    WechatEvent::ContextObserved(context) => {
-                        let _ = event_store.upsert_context(context).await;
-                    }
-                    WechatEvent::CursorAdvanced {
-                        account_key,
-                        cursor,
-                    } => {
-                        let _ = event_store.save_cursor(account_key, cursor).await;
-                    }
-                    WechatEvent::AuthSessionExpired { account_key } => {
-                        eprintln!("WeChat auth expired for account {account_key}; re-login needed");
-                    }
-                    WechatEvent::Message(message) => {
-                        println!("{}: {}", message.user_id, message.text);
-                    }
-                    WechatEvent::UserInteractionRequested {
-                        account_key,
-                        user_id,
-                        reason,
-                    } => {
-                        eprintln!(
-                            "WeChat user interaction suggested for account {account_key}, user {user_id:?}: {reason:?}"
-                        );
-                    }
-                }
-            });
-        }))
-        .await;
 
     let reminder_client = Arc::clone(&client);
     let reminder_store = store.clone();
@@ -220,6 +180,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let cursor = store.cursor(&account_key).await;
-    client.run_from_cursor(cursor).await?;
+    let mut events = Arc::clone(&client).stream_from_cursor(cursor);
+    while let Some(event) = events.next().await {
+        match event? {
+            WechatEvent::ContextObserved(context) => {
+                store.upsert_context(context).await?;
+            }
+            WechatEvent::CursorAdvanced {
+                account_key,
+                cursor,
+            } => {
+                store.save_cursor(account_key, cursor).await?;
+            }
+            WechatEvent::AuthSessionExpired { account_key } => {
+                eprintln!("WeChat auth expired for account {account_key}; re-login needed");
+                break;
+            }
+            WechatEvent::Message(message) => {
+                println!("{}: {}", message.user_id, message.text);
+            }
+            WechatEvent::UserInteractionRequested {
+                account_key,
+                user_id,
+                reason,
+            } => {
+                eprintln!(
+                    "WeChat user interaction suggested for account {account_key}, user {user_id:?}: {reason:?}"
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+async fn login_and_save(
+    client: &WechatIlinkClient,
+    store: &Store,
+) -> wechat_ilink::Result<Credentials> {
+    let mut login = client.login_qr_stream();
+    while let Some(event) = login.next().await {
+        match event? {
+            LoginQrEvent::QrCode { content } => eprintln!("scan QR: {content}"),
+            LoginQrEvent::StatusChanged { status } => eprintln!("QR login status: {status}"),
+            LoginQrEvent::NeedVerifyCode { prompt, responder } => {
+                eprintln!("{prompt}; verification-code entry not implemented in this example");
+                let _ = responder.cancel();
+            }
+            LoginQrEvent::Confirmed { credentials } => {
+                store
+                    .save_credentials(credentials.clone())
+                    .await
+                    .map_err(wechat_ilink::WechatIlinkError::Io)?;
+                return Ok(credentials);
+            }
+        }
+    }
+    Err(wechat_ilink::WechatIlinkError::Auth(
+        "QR login stream ended before confirmation".into(),
+    ))
 }

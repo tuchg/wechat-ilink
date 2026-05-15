@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use wechat_ilink::{Credentials, WechatContext, WechatEvent, WechatIlinkClient};
+use wechat_ilink::{Credentials, LoginQrEvent, WechatContext, WechatEvent, WechatIlinkClient};
 
 #[derive(Debug, Clone)]
 struct AccountConfig {
@@ -129,10 +129,6 @@ async fn run_account(
             .bot_agent(format!("MultiAccountExample/0.1 ({})", config.name))
             .ilink_app_id("bot")
             .markdown_filter(true)
-            .on_qr_url({
-                let account_name = config.name.clone();
-                move |url| eprintln!("[{account_name}] scan QR: {url}")
-            })
             .build(),
     );
 
@@ -143,54 +139,10 @@ async fn run_account(
         }
         None => {
             // First run for each account opens its own QR login flow.
-            let credentials = client.login_qr().await?;
-            store.save_credentials(credentials.clone()).await?;
-            credentials
+            login_and_save(&client, &store, &config.name).await?
         }
     };
     let account_key = account_key(&credentials);
-
-    let event_store = store.clone();
-    let account_name = config.name.clone();
-    client
-        .on_event(Box::new(move |event| {
-            let event_store = event_store.clone();
-            let account_name = account_name.clone();
-            let event = event.clone();
-            tokio::spawn(async move {
-                match event {
-                    WechatEvent::ContextObserved(context) => {
-                        // Contexts include protocol account_key. This prevents collisions when
-                        // two login accounts see the same WeChat user_id.
-                        let _ = event_store.upsert_context(context).await;
-                    }
-                    WechatEvent::CursorAdvanced {
-                        account_key,
-                        cursor,
-                    } => {
-                        let _ = event_store.save_cursor(account_key, cursor).await;
-                    }
-                    WechatEvent::Message(message) => {
-                        println!("[{account_name}] {}: {}", message.user_id, message.text);
-                    }
-                    WechatEvent::AuthSessionExpired { account_key } => {
-                        eprintln!(
-                            "[{account_name}] auth expired for {account_key}; re-login required"
-                        );
-                    }
-                    WechatEvent::UserInteractionRequested {
-                        account_key,
-                        user_id,
-                        reason,
-                    } => {
-                        eprintln!(
-                            "[{account_name}] user interaction suggested for {account_key}, user {user_id:?}: {reason:?}"
-                        );
-                    }
-                }
-            });
-        }))
-        .await;
 
     // Optional demo send for this specific login account:
     // WECHAT_ILINK_SEND_TO_USER=<user_id> cargo run --example multi_account_context_store
@@ -211,6 +163,71 @@ async fn run_account(
     }
 
     let cursor = store.cursor(&account_key).await;
-    client.run_from_cursor(cursor).await?;
+    let mut events = Arc::clone(&client).stream_from_cursor(cursor);
+    while let Some(event) = events.next().await {
+        match event? {
+            WechatEvent::ContextObserved(context) => {
+                // Contexts include protocol account_key. This prevents collisions when
+                // two login accounts see the same WeChat user_id.
+                store.upsert_context(context).await?;
+            }
+            WechatEvent::CursorAdvanced {
+                account_key,
+                cursor,
+            } => {
+                store.save_cursor(account_key, cursor).await?;
+            }
+            WechatEvent::Message(message) => {
+                println!("[{}] {}: {}", config.name, message.user_id, message.text);
+            }
+            WechatEvent::AuthSessionExpired { account_key } => {
+                eprintln!(
+                    "[{}] auth expired for {account_key}; re-login required",
+                    config.name
+                );
+                break;
+            }
+            WechatEvent::UserInteractionRequested {
+                account_key,
+                user_id,
+                reason,
+            } => {
+                eprintln!(
+                    "[{}] user interaction suggested for {account_key}, user {user_id:?}: {reason:?}",
+                    config.name
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+async fn login_and_save(
+    client: &WechatIlinkClient,
+    store: &AccountStore,
+    account_name: &str,
+) -> wechat_ilink::Result<Credentials> {
+    let mut login = client.login_qr_stream();
+    while let Some(event) = login.next().await {
+        match event? {
+            LoginQrEvent::QrCode { content } => eprintln!("[{account_name}] scan QR: {content}"),
+            LoginQrEvent::StatusChanged { status } => {
+                eprintln!("[{account_name}] QR login status: {status}")
+            }
+            LoginQrEvent::NeedVerifyCode { prompt, responder } => {
+                eprintln!("[{account_name}] {prompt}; verification-code entry not implemented in this example");
+                let _ = responder.cancel();
+            }
+            LoginQrEvent::Confirmed { credentials } => {
+                store
+                    .save_credentials(credentials.clone())
+                    .await
+                    .map_err(wechat_ilink::WechatIlinkError::Io)?;
+                return Ok(credentials);
+            }
+        }
+    }
+    Err(wechat_ilink::WechatIlinkError::Auth(
+        "QR login stream ended before confirmation".into(),
+    ))
 }

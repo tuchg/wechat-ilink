@@ -1,6 +1,6 @@
 # wechat-ilink
 
-Async WeChat iLink protocol client for Rust. Builder-based, event-driven, and fully stateless — your app owns credentials, context tokens, and cursors. Handles QR login, event-driven polling, automatic context refresh from incoming messages, typed rate limiting with automatic backoff, and context-expiry interaction events.
+Stream-first async WeChat iLink protocol client for Rust. Builder-based, event-driven, and fully stateless — your app owns credentials, context tokens, and cursors. Handles QR login, event-driven polling, automatic context refresh from incoming messages, typed rate limiting with automatic backoff, and context-expiry interaction events.
 
 中文：[README.md](README.md)
 
@@ -17,7 +17,7 @@ Async WeChat iLink protocol client for Rust. Builder-based, event-driven, and fu
 
 ```toml
 [dependencies]
-wechat-ilink = "0.2"
+wechat-ilink = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,42 +32,61 @@ use wechat_ilink::WechatIlinkClient;
 ## Quick start
 
 ```rust,no_run
-use wechat_ilink::{WechatEvent, WechatIlinkClient};
+use std::sync::Arc;
+
+use wechat_ilink::{LoginQrEvent, WechatEvent, WechatIlinkClient};
 
 #[tokio::main]
 async fn main() -> wechat_ilink::Result<()> {
-    let client = WechatIlinkClient::builder()
-        .bot_agent("MyBot/0.1")
-        .ilink_app_id("bot")
-        // Enabled by default. Disable to send text without WeChat Markdown filtering.
-        .markdown_filter(true)
-        // ret=-2 defaults to 90s wait and 5 retries; event fires near 6 sends / 5 minutes.
-        .rate_limit_retry_after(std::time::Duration::from_secs(90))
-        .rate_limit_max_retries(5)
-        .rate_limit_interaction_threshold(6)
-        // Context defaults to 24h TTL; event fires 30 minutes before expiry.
-        .context_ttl(std::time::Duration::from_secs(24 * 60 * 60))
-        .context_expiry_remind_before(std::time::Duration::from_secs(30 * 60))
-        .on_qr_url(|url| eprintln!("scan QR: {url}"))
-        .build();
+    let client = Arc::new(
+        WechatIlinkClient::builder()
+            .bot_agent("MyBot/0.1")
+            .ilink_app_id("bot")
+            // Enabled by default. Disable to send text without WeChat Markdown filtering.
+            .markdown_filter(true)
+            // ret=-2 defaults to 90s wait and 5 retries; event fires near 6 sends / 5 minutes.
+            .rate_limit_retry_after(std::time::Duration::from_secs(90))
+            .rate_limit_max_retries(5)
+            .rate_limit_interaction_threshold(6)
+            // Context defaults to 24h TTL; event fires 30 minutes before expiry.
+            .context_ttl(std::time::Duration::from_secs(24 * 60 * 60))
+            .context_expiry_remind_before(std::time::Duration::from_secs(30 * 60))
+            .build(),
+    );
 
     // Credentials are owned by your application; the SDK does not read or write
     // credential files.
     if let Some(credentials) = my_load_credentials().await {
         client.set_credentials(credentials).await;
     } else {
-        let credentials = client.login_qr().await?;
-        my_save_credentials(&credentials).await;
+        let mut login = client.login_qr_stream();
+        while let Some(event) = login.next().await {
+            match event? {
+                LoginQrEvent::QrCode { content } => eprintln!("scan QR: {content}"),
+                LoginQrEvent::StatusChanged { status } => eprintln!("login status: {status}"),
+                LoginQrEvent::NeedVerifyCode { responder, .. } => {
+                    // The app may read a verification code and call responder.send(code).
+                    let _ = responder.cancel();
+                }
+                LoginQrEvent::Confirmed { credentials } => {
+                    my_save_credentials(&credentials).await;
+                    break;
+                }
+            }
+        }
     }
 
-    client
-        .on_event(Box::new(|event| match event {
+    let cursor = my_load_cursor().await;
+    let mut events = client.stream_from_cursor(cursor);
+    while let Some(event) = events.next().await {
+        match event? {
             WechatEvent::ContextObserved(context) => {
-                // Persist context for later send_text_with_context / send_media_with_context.
+                // Automatically observed/refreshed from incoming messages; persist it
+                // for later send_*_with_context calls.
                 let _ = context;
             }
             WechatEvent::CursorAdvanced { account_key, cursor } => {
-                // Persist cursor and pass it to run_from_cursor on next startup.
+                // Persist cursor and pass it to stream_from_cursor on next startup.
                 let _ = (account_key, cursor);
             }
             WechatEvent::Message(message) => {
@@ -75,16 +94,15 @@ async fn main() -> wechat_ilink::Result<()> {
             }
             WechatEvent::AuthSessionExpired { account_key } => {
                 eprintln!("auth expired: {account_key}");
+                break;
             }
             WechatEvent::UserInteractionRequested { account_key, user_id, reason } => {
                 // SDK only notifies; the app decides whether to ask the user to reply in WeChat.
                 eprintln!("user interaction suggested: {account_key} {user_id:?} {reason:?}");
             }
-        }))
-        .await;
-
-    let cursor = my_load_cursor().await;
-    client.run_from_cursor(cursor).await
+        }
+    }
+    Ok(())
 }
 
 async fn my_load_credentials() -> Option<wechat_ilink::Credentials> { None }
@@ -100,9 +118,10 @@ See [`examples/multi_account_context_store.rs`](examples/multi_account_context_s
 
 `wechat-ilink` is a low-level async protocol client. It handles:
 
-- QR login that returns credentials;
-- WeChat iLink long polling;
+- stream-based QR login, polling events, and errors;
+- event-driven WeChat iLink polling;
 - wire-message parsing into `IncomingMessage`;
+- automatic `WechatContext` observation/refresh from incoming messages;
 - explicit-context text, media, and typing sends;
 - incoming media download and CDN upload helpers;
 - protocol error mapping.
@@ -168,7 +187,7 @@ bot.send_media_with_context(
 
 ## Events
 
-`WechatEvent` is the recommended integration point:
+`stream_from_cursor` is the recommended integration point:
 
 - `ContextObserved(WechatContext)`: a new context token was observed from an incoming message.
 - `Message(IncomingMessage)`: parsed incoming message.

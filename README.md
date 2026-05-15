@@ -1,6 +1,6 @@
 # wechat-ilink
 
-非官方 WeChat iLink 协议客户端：QR 登录 · 事件驱动轮询 · 自动从入站消息观测并刷新 context · 类型化速率限制（ret=-2）与自动退避 · context TTL 过期交互事件 · 显式 context 发送文本/媒体/typing · CDN 上传/下载。全无状态 —— 所有 credentials / context / cursor 由应用管理。
+非官方 WeChat iLink 协议客户端：stream-first API · QR 登录 · 事件驱动轮询 · 自动从入站消息观测并刷新 context · 类型化速率限制（ret=-2）与自动退避 · context TTL 过期交互事件 · 显式 context 发送文本/媒体/typing · CDN 上传/下载。全无状态 —— 所有 credentials / context / cursor 由应用管理。
 
 English: [README.en.md](README.en.md)
 
@@ -17,7 +17,7 @@ English: [README.en.md](README.en.md)
 
 ```toml
 [dependencies]
-wechat-ilink = "0.2"
+wechat-ilink = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,41 +32,59 @@ use wechat_ilink::WechatIlinkClient;
 ## Quick start
 
 ```rust,no_run
-use wechat_ilink::{WechatEvent, WechatIlinkClient};
+use std::sync::Arc;
+
+use wechat_ilink::{LoginQrEvent, WechatEvent, WechatIlinkClient};
 
 #[tokio::main]
 async fn main() -> wechat_ilink::Result<()> {
-    let client = WechatIlinkClient::builder()
-        .bot_agent("MyBot/0.1")
-        .ilink_app_id("bot")
-        // 默认启用。关闭后，发送文本不会做 WeChat Markdown 兼容过滤。
-        .markdown_filter(true)
-        // ret=-2 默认等待 90s，最多重试 5 次；接近 5 分钟 6 条时发事件。
-        .rate_limit_retry_after(std::time::Duration::from_secs(90))
-        .rate_limit_max_retries(5)
-        .rate_limit_interaction_threshold(6)
-        // context 默认 24h TTL，到期前 30 分钟发 UserInteractionRequested 事件。
-        .context_ttl(std::time::Duration::from_secs(24 * 60 * 60))
-        .context_expiry_remind_before(std::time::Duration::from_secs(30 * 60))
-        .on_qr_url(|url| eprintln!("scan QR: {url}"))
-        .build();
+    let client = Arc::new(
+        WechatIlinkClient::builder()
+            .bot_agent("MyBot/0.1")
+            .ilink_app_id("bot")
+            // 默认启用。关闭后，发送文本不会做 WeChat Markdown 兼容过滤。
+            .markdown_filter(true)
+            // ret=-2 默认等待 90s，最多重试 5 次；接近 5 分钟 6 条时发事件。
+            .rate_limit_retry_after(std::time::Duration::from_secs(90))
+            .rate_limit_max_retries(5)
+            .rate_limit_interaction_threshold(6)
+            // context 默认 24h TTL，到期前 30 分钟发 UserInteractionRequested 事件。
+            .context_ttl(std::time::Duration::from_secs(24 * 60 * 60))
+            .context_expiry_remind_before(std::time::Duration::from_secs(30 * 60))
+            .build(),
+    );
 
     // 凭证由应用层加载；SDK 不读写 credential 文件。
     if let Some(credentials) = my_load_credentials().await {
         client.set_credentials(credentials).await;
     } else {
-        let credentials = client.login_qr().await?;
-        my_save_credentials(&credentials).await;
+        let mut login = client.login_qr_stream();
+        while let Some(event) = login.next().await {
+            match event? {
+                LoginQrEvent::QrCode { content } => eprintln!("scan QR: {content}"),
+                LoginQrEvent::StatusChanged { status } => eprintln!("login status: {status}"),
+                LoginQrEvent::NeedVerifyCode { responder, .. } => {
+                    // 应用可以读取验证码后 responder.send(code)。
+                    let _ = responder.cancel();
+                }
+                LoginQrEvent::Confirmed { credentials } => {
+                    my_save_credentials(&credentials).await;
+                    break;
+                }
+            }
+        }
     }
 
-    client
-        .on_event(Box::new(|event| match event {
+    let cursor = my_load_cursor().await;
+    let mut events = client.stream_from_cursor(cursor);
+    while let Some(event) = events.next().await {
+        match event? {
             WechatEvent::ContextObserved(context) => {
-                // 保存 context，用于之后 send_text_with_context / send_media_with_context。
+                // 自动从入站消息观测/刷新 context；保存后用于主动 send_*_with_context。
                 let _ = context;
             }
             WechatEvent::CursorAdvanced { account_key, cursor } => {
-                // 保存 cursor，下次启动传给 run_from_cursor。
+                // 保存 cursor，下次启动传给 stream_from_cursor。
                 let _ = (account_key, cursor);
             }
             WechatEvent::Message(message) => {
@@ -74,16 +92,15 @@ async fn main() -> wechat_ilink::Result<()> {
             }
             WechatEvent::AuthSessionExpired { account_key } => {
                 eprintln!("auth expired: {account_key}");
+                break;
             }
             WechatEvent::UserInteractionRequested { account_key, user_id, reason } => {
                 // SDK 只通知；应用决定是否提醒用户在微信里发一条消息来刷新窗口。
                 eprintln!("user interaction suggested: {account_key} {user_id:?} {reason:?}");
             }
-        }))
-        .await;
-
-    let cursor = my_load_cursor().await;
-    client.run_from_cursor(cursor).await
+        }
+    }
+    Ok(())
 }
 
 async fn my_load_credentials() -> Option<wechat_ilink::Credentials> { None }
@@ -99,9 +116,10 @@ async fn my_load_cursor() -> Option<String> { None }
 
 `wechat-ilink` 是底层异步协议客户端，负责：
 
-- QR 登录并返回 credentials；
-- WeChat iLink 长轮询；
+- 以 stream 形式暴露 QR 登录状态、轮询事件和错误；
+- WeChat iLink 事件驱动轮询；
 - wire message 到 `IncomingMessage` 的解析；
+- 自动从入站消息观测并刷新 `WechatContext`；
 - 显式 context 发送文本、媒体、typing；
 - 入站媒体下载、CDN 上传辅助；
 - 协议错误映射。
@@ -168,7 +186,7 @@ bot.send_media_with_context(
 
 ## 事件
 
-推荐通过 `WechatEvent` 集成：
+推荐通过 `stream_from_cursor` 集成：
 
 - `ContextObserved(WechatContext)`：从入站消息观察到新的 context token。
 - `Message(IncomingMessage)`：解析后的入站消息。

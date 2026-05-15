@@ -5,20 +5,37 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use wechat_ilink::WechatIlinkClient;
+//! use std::sync::Arc;
+//!
+//! use wechat_ilink::{LoginQrEvent, WechatIlinkClient};
 //!
 //! #[tokio::main]
-//! async fn main() {
-//!     let client = WechatIlinkClient::builder().build();
-//!     let credentials = client.login_qr().await.unwrap();
-//!     // Persist credentials in your application store.
-//!     let _ = credentials;
+//! async fn main() -> wechat_ilink::Result<()> {
+//!     let client = Arc::new(WechatIlinkClient::builder().build());
 //!
-//!     client.on_event(Box::new(|event| {
-//!         println!("{event:?}");
-//!     })).await;
+//!     let mut login = client.login_qr_stream();
+//!     while let Some(event) = login.next().await {
+//!         match event? {
+//!             LoginQrEvent::QrCode { content } => eprintln!("scan QR: {content}"),
+//!             LoginQrEvent::Confirmed { credentials } => {
+//!                 // Persist credentials in your application store.
+//!                 let _ = credentials;
+//!                 break;
+//!             }
+//!             LoginQrEvent::NeedVerifyCode { responder, .. } => {
+//!                 let _ = responder.cancel();
+//!             }
+//!             LoginQrEvent::StatusChanged { .. } => {}
+//!         }
+//!     }
 //!
-//!     client.run_from_cursor(None).await.unwrap();
+//!     drop(login);
+//!
+//!     let mut events = client.stream_from_cursor(None);
+//!     while let Some(event) = events.next().await {
+//!         println!("{:?}", event?);
+//!     }
+//!     Ok(())
 //! }
 //! ```
 
@@ -31,8 +48,9 @@ pub mod protocol;
 pub mod types;
 
 pub use bot::{
-    EventHandler, MessageHandler, SendContent, SendReceipt, UserInteractionReason, WechatEvent,
-    WechatIlinkClient, WechatIlinkClientBuilder, WechatRateLimitOptions,
+    LoginQrEvent, LoginQrStream, SendContent, SendReceipt, UserInteractionReason,
+    VerifyCodeResponder, WechatEvent, WechatEventStream, WechatIlinkClient,
+    WechatIlinkClientBuilder, WechatRateLimitOptions,
 };
 pub use cdn::CdnClient;
 pub use crypto::{
