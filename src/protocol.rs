@@ -133,19 +133,28 @@ pub struct ILinkClient {
     options: ILinkClientOptions,
 }
 
+fn default_http_client() -> Client {
+    Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .unwrap()
+}
+
 impl ILinkClient {
     pub fn new() -> Self {
         Self::with_options(ILinkClientOptions::default())
     }
 
     pub fn with_options(options: ILinkClientOptions) -> Self {
-        Self {
-            http: Client::builder()
-                .timeout(Duration::from_secs(45))
-                .build()
-                .unwrap(),
-            options,
-        }
+        Self::with_http_client_and_options(default_http_client(), options)
+    }
+
+    pub fn with_http_client(http: Client) -> Self {
+        Self::with_http_client_and_options(http, ILinkClientOptions::default())
+    }
+
+    pub fn with_http_client_and_options(http: Client, options: ILinkClientOptions) -> Self {
+        Self { http, options }
     }
 
     pub async fn get_qr_code(&self, base_url: &str) -> Result<QrCodeResponse> {
@@ -789,6 +798,21 @@ fn build_text_message_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ilink_client_accepts_caller_provided_reqwest_client() {
+        let http_client = reqwest::Client::new();
+        let client = ILinkClient::with_http_client_and_options(
+            http_client,
+            ILinkClientOptions {
+                bot_agent: Some("Amux/0.1".to_string()),
+                ..ILinkClientOptions::default()
+            },
+        );
+
+        let base_info = client.base_info();
+        assert_eq!(base_info.bot_agent.as_deref(), Some("Amux/0.1"));
+    }
 
     #[test]
     fn base_info_preserves_bot_agent_when_configured() {

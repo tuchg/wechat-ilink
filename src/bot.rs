@@ -231,6 +231,7 @@ pub struct WechatIlinkClientBuilder {
     markdown_filter: bool,
     rate_limit: WechatRateLimitOptions,
     credentials: Option<Credentials>,
+    http_client: Option<reqwest::Client>,
 }
 
 impl Default for WechatIlinkClientBuilder {
@@ -243,6 +244,7 @@ impl Default for WechatIlinkClientBuilder {
             markdown_filter: true,
             rate_limit: WechatRateLimitOptions::default(),
             credentials: None,
+            http_client: None,
         }
     }
 }
@@ -326,6 +328,11 @@ impl WechatIlinkClientBuilder {
         self
     }
 
+    pub fn http_client(mut self, http_client: reqwest::Client) -> Self {
+        self.http_client = Some(http_client);
+        self
+    }
+
     pub fn build(self) -> WechatIlinkClient {
         WechatIlinkClient::from_builder(self)
     }
@@ -363,14 +370,22 @@ impl WechatIlinkClient {
             .map(|creds| creds.base_url.clone())
             .or(builder.base_url)
             .unwrap_or_else(|| protocol::DEFAULT_BASE_URL.to_string());
+        let options = ILinkClientOptions {
+            bot_agent: builder.bot_agent,
+            route_tag: builder.route_tag,
+            ilink_app_id: builder.ilink_app_id,
+            markdown_filter: builder.markdown_filter,
+        };
+        let (client, cdn) = match builder.http_client {
+            Some(http_client) => (
+                ILinkClient::with_http_client_and_options(http_client.clone(), options),
+                CdnClient::with_client(http_client),
+            ),
+            None => (ILinkClient::with_options(options), CdnClient::new()),
+        };
         Self {
-            client: Arc::new(ILinkClient::with_options(ILinkClientOptions {
-                bot_agent: builder.bot_agent,
-                route_tag: builder.route_tag,
-                ilink_app_id: builder.ilink_app_id,
-                markdown_filter: builder.markdown_filter,
-            })),
-            cdn: CdnClient::new(),
+            client: Arc::new(client),
+            cdn,
             credentials: RwLock::new(builder.credentials),
             event_tx: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
             rate_limit_states: Mutex::new(HashMap::new()),
@@ -1451,6 +1466,14 @@ fn chrono_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builder_accepts_caller_provided_reqwest_client() {
+        let http_client = reqwest::Client::new();
+        let _client = WechatIlinkClient::builder()
+            .http_client(http_client)
+            .build();
+    }
 
     #[test]
     fn chunk_text_short() {
