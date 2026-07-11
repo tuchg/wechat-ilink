@@ -236,14 +236,15 @@ impl ILinkClient {
         Ok(result)
     }
 
-    pub async fn send_message(&self, base_url: &str, token: &str, msg: &Value) -> Result<()> {
+    /// Send a message. Returns the raw API JSON so callers can capture
+    /// server-assigned `message_id` values (needed for quote routing).
+    pub async fn send_message(&self, base_url: &str, token: &str, msg: &Value) -> Result<Value> {
         let body = json!({
             "msg": msg,
             "base_info": self.base_info()
         });
         self.api_post(base_url, "/ilink/bot/sendmessage", token, &body, 15)
-            .await?;
-        Ok(())
+            .await
     }
 
     pub async fn get_config(

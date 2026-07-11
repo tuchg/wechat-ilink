@@ -20,7 +20,7 @@ use crate::protocol::{self, ILinkClient, ILinkClientOptions};
 use crate::types::*;
 use md5::{Digest, Md5};
 use rand::Rng;
-use serde_json::json;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -59,6 +59,7 @@ impl SendReceipt {
         self.message_ids.last().map(String::as_str)
     }
 
+    #[allow(dead_code)]
     fn single(message_id: String) -> Self {
         Self {
             message_ids: vec![message_id],
@@ -1151,10 +1152,14 @@ impl WechatIlinkClient {
             vec![item],
             &client_id,
         );
-        self.retry_rate_limited(|| self.client.send_message(base_url, token, &msg))
+        let resp = self
+            .retry_rate_limited(|| self.client.send_message(base_url, token, &msg))
             .await?;
         self.record_successful_message_send().await;
-        Ok(SendReceipt::single(client_id))
+        Ok(SendReceipt {
+            message_ids: collect_send_message_ids(&client_id, &resp),
+            visible_texts: Vec::new(),
+        })
     }
 
     async fn cdn_upload(
@@ -1226,10 +1231,18 @@ impl WechatIlinkClient {
                 &chunk,
                 &client_id,
             );
-            self.retry_rate_limited(|| self.client.send_message(&base_url, &token, &msg))
+            let resp = self
+                .retry_rate_limited(|| self.client.send_message(&base_url, &token, &msg))
                 .await?;
             self.record_successful_message_send().await;
-            message_ids.push(client_id);
+            // Always keep client_id (stable local id). Also keep any server-assigned
+            // ids from the response so quote payloads that reference wire message_id
+            // (numeric) can resolve.
+            for id in collect_send_message_ids(&client_id, &resp) {
+                if !message_ids.iter().any(|existing| existing == &id) {
+                    message_ids.push(id);
+                }
+            }
             visible_texts.push(chunk);
         }
         Ok(SendReceipt {
@@ -1399,6 +1412,54 @@ fn categorize_by_extension(filename: &str) -> &'static str {
         "mp4" | "mov" | "webm" | "mkv" | "avi" => "video",
         _ => "file",
     }
+}
+
+/// Collect local client_id plus any server-assigned ids present in sendmessage JSON.
+///
+/// WeChat quote payloads often reference the **server** numeric `message_id`, while
+/// outbound builders only know the caller-supplied `client_id` (UUID). Binding both
+/// is required for quote routing.
+pub(crate) fn collect_send_message_ids(client_id: &str, resp: &Value) -> Vec<String> {
+    let mut ids = vec![client_id.to_string()];
+    let mut push = |s: String| {
+        if !s.is_empty() && !ids.iter().any(|existing| existing == &s) {
+            ids.push(s);
+        }
+    };
+    let mut consider = |v: &Value| {
+        if let Some(n) = v.as_i64() {
+            push(n.to_string());
+        } else if let Some(u) = v.as_u64() {
+            push(u.to_string());
+        } else if let Some(s) = v.as_str() {
+            push(s.to_string());
+        }
+    };
+    // Known / likely response shapes (API may evolve; keep extraction defensive).
+    for path in [
+        "/message_id",
+        "/msg_id",
+        "/msg/message_id",
+        "/msg/msg_id",
+        "/data/message_id",
+        "/data/msg_id",
+        "/result/message_id",
+        "/result/msg_id",
+    ] {
+        if let Some(v) = resp.pointer(path) {
+            consider(v);
+        }
+    }
+    // Shallow object scan for any *message_id / *msg_id keys.
+    if let Some(obj) = resp.as_object() {
+        for (k, v) in obj {
+            let key = k.to_ascii_lowercase();
+            if key.contains("message_id") || key == "msg_id" || key.ends_with("_msg_id") {
+                consider(v);
+            }
+        }
+    }
+    ids
 }
 
 fn chunk_text(text: &str, limit: usize) -> Vec<String> {
@@ -1888,5 +1949,16 @@ mod tests {
 
         let creds = client.credentials().await.unwrap();
         assert_eq!(creds.account_id, "account-1");
+    }
+
+    #[test]
+    fn collect_send_message_ids_keeps_client_and_server_ids() {
+        let resp = serde_json::json!({
+            "ret": 0,
+            "message_id": 7481615214657239688i64,
+        });
+        let ids = collect_send_message_ids("5c70a44d-7548-4afd-88fc-8320c7d3aab1", &resp);
+        assert!(ids.contains(&"5c70a44d-7548-4afd-88fc-8320c7d3aab1".to_string()));
+        assert!(ids.contains(&"7481615214657239688".to_string()));
     }
 }
